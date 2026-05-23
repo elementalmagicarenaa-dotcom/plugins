@@ -648,32 +648,38 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         if not ch:
             return
 
-        week      = self._week_key()
-        week_data = self._mod_actions.get(week, {})
-        staff_ids = self._cfg_list("STAFF_IDS") or [int(k) for k in week_data if k.isdigit()]
+        now = datetime.now(timezone.utc)
 
-        now    = datetime.now(timezone.utc)
-        monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
-        sunday = monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        # Report fires on Monday — we want LAST week's data (Mon–Sun just ended)
+        last_week_dt = now - timedelta(days=7)
+        week         = self._week_key(last_week_dt)
+        week_data    = self._mod_actions.get(week, {})
+        staff_ids    = self._cfg_list("STAFF_IDS") or [int(k) for k in week_data if k.isdigit()]
+
+        # Date range for the report header (last Mon → last Sun)
+        last_monday = (last_week_dt - timedelta(days=last_week_dt.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        last_sunday = last_monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
 
         header = discord.Embed(
             title="📊  Weekly Moderation Activity Report",
             description=(
-                f"**Period:** {ts(monday, 'D')} — {ts(sunday, 'D')}\n"
-                f"*Automatically generated every Monday.*"
+                f"**Period:** {ts(last_monday, 'D')} — {ts(last_sunday, 'D')}\n"
+                f"*Automatically generated every Monday — covering the previous week's actions.*"
             ),
             color=0x5865F2,
             timestamp=now,
         )
         header.set_footer(
-            text=f"Week {now.strftime('%W')} · {now.year}",
+            text=f"Week {last_week_dt.strftime('%W')} · {last_week_dt.year}",
             icon_url=self.bot.user.display_avatar.url,
         )
         await ch.send(embed=header)
 
         if not staff_ids:
             await ch.send(embed=discord.Embed(
-                description="No moderation activity recorded this week.",
+                description="No moderation activity recorded last week.",
                 color=0x95A5A6,
             ))
             return
@@ -684,28 +690,38 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             except discord.NotFound:
                 continue
 
-            actions = week_data.get(str(uid), {})
-            total   = sum(actions.values())
-            rank    = self._member_rank(member)
+            actions      = week_data.get(str(uid), {})
+            total        = sum(actions.values())
+            rank         = self._member_rank(member)
             rank_display = f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Staff"
 
-            lines = [
-                f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {actions[a]}×"
-                for a in ALL_ACTIONS if actions.get(a, 0)
-            ] or ["*No actions recorded this week.*"]
+            # Build per-action breakdown — show all tracked action types with their counts
+            breakdown_lines = []
+            for a in ALL_ACTIONS:
+                count = actions.get(a, 0)
+                breakdown_lines.append(
+                    f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}"
+                )
 
             embed = discord.Embed(
                 title=f"Staff Activity — {member.display_name}",
-                color=0x5865F2,
+                color=0x5865F2 if total > 0 else 0x95A5A6,
                 timestamp=now,
             )
-            embed.set_author(name=f"{member.display_name}  ·  {rank_display}", icon_url=member.display_avatar.url)
-            embed.add_field(name="Staff Member",   value=member.mention,   inline=True)
-            embed.add_field(name="Rank",           value=rank_display,     inline=True)
-            embed.add_field(name="Total Actions",  value=str(total),       inline=True)
-            embed.add_field(name="📋  Actions This Week", value="\n".join(lines), inline=False)
+            embed.set_author(
+                name=f"{member.display_name}  ·  {rank_display}",
+                icon_url=member.display_avatar.url,
+            )
+            embed.add_field(name="👤  Staff Member",  value=member.mention,   inline=True)
+            embed.add_field(name="🏅  Rank",          value=rank_display,     inline=True)
+            embed.add_field(name="📈  Total Actions", value=str(total),       inline=True)
+            embed.add_field(
+                name="📋  Actions This Week",
+                value="\n".join(breakdown_lines),
+                inline=False,
+            )
             embed.set_footer(
-                text=f"User ID: {uid}  ·  Auto-generated",
+                text=f"User ID: {uid}  ·  {last_monday.strftime('%d %b')} – {last_sunday.strftime('%d %b %Y')}",
                 icon_url=self.bot.user.display_avatar.url,
             )
             await ch.send(embed=embed)
