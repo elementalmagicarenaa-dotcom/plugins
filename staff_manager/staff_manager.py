@@ -212,17 +212,19 @@ def ts(dt: datetime, style: str = "F") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Config / env helpers
+# Config — reads from config.json in the same folder as this file
 # ---------------------------------------------------------------------------
 
-def _env_int(key: str, default: int = 0) -> int:
-    v = os.environ.get(key, "")
-    return int(v) if v.isdigit() else default
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-
-def _env_list(key: str) -> List[int]:
-    v = os.environ.get(key, "")
-    return [int(x.strip()) for x in v.split(",") if x.strip().isdigit()]
+def _load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -394,21 +396,33 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     # ------------------------------------------------------------------ #
 
     def _cfg(self, key: str, default: str = "") -> str:
-        try:
-            v = self.bot.config.get(key)
-            if v:
-                return str(v)
-        except Exception:
-            pass
+        cfg = _load_config()
+        v = cfg.get(key)
+        # Handle list values stored as JSON arrays
+        if isinstance(v, list):
+            return ",".join(str(x) for x in v)
+        if v is not None and str(v) != "0":
+            return str(v)
+        # Fall back to env var
         return os.environ.get(key, default)
 
     def _cfg_int(self, key: str, default: int = 0) -> int:
-        v = self._cfg(key)
-        return int(v) if v.isdigit() else default
+        cfg = _load_config()
+        v = cfg.get(key)
+        if isinstance(v, int) and v != 0:
+            return v
+        env = os.environ.get(key, "")
+        return int(env) if env.isdigit() else default
 
     def _cfg_list(self, key: str) -> List[int]:
-        v = self._cfg(key, "")
-        return [int(x.strip()) for x in v.split(",") if x.strip().isdigit()]
+        cfg = _load_config()
+        v = cfg.get(key)
+        # Native JSON array
+        if isinstance(v, list):
+            return [int(x) for x in v if str(x).isdigit() or isinstance(x, int)]
+        # Comma-separated string fallback
+        s = os.environ.get(key, "")
+        return [int(x.strip()) for x in s.split(",") if x.strip().isdigit()]
 
     @property
     def _dyno_id(self) -> int:
