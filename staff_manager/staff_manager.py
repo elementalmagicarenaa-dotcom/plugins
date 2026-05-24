@@ -581,15 +581,27 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         totals: Dict[str, int] = {}
         for week_data in self._mod_actions.values():
             for act, count in week_data.get(str(user_id), {}).items():
-                totals[act] = totals.get(act, 0) + count
+                if act.endswith("_links"):  # skip evidence link lists
+                    continue
+                if isinstance(count, int):
+                    totals[act] = totals.get(act, 0) + count
         return totals
+
+    def _week_actions(self, user_id: int, week_key: str) -> Dict[str, int]:
+        """Return action counts for a single week (no _links keys)."""
+        raw = self._mod_actions.get(week_key, {}).get(str(user_id), {})
+        return {k: v for k, v in raw.items() if not k.endswith("_links") and isinstance(v, int)}
+
+    def _week_links(self, user_id: int, week_key: str, action: str) -> List[str]:
+        """Return stored evidence links for a specific action in a given week."""
+        raw = self._mod_actions.get(week_key, {}).get(str(user_id), {})
+        return list(raw.get(f"{action}_links", []))
 
     def _week_key(self, dt: Optional[datetime] = None) -> str:
         return (dt or datetime.now(timezone.utc)).strftime("%Y-W%W")
 
-    def _record_action(self, moderator_id: int, action: str) -> None:
-        # Always re-read from disk before writing so a crash or restart never
-        # causes a previous entry to be silently overwritten.
+    def _record_action(self, moderator_id: int, action: str, link: Optional[str] = None) -> None:
+        """Increment the action counter and optionally store an evidence link."""
         self._mod_actions = _load(MOD_ACTIONS_FILE)
         week = self._week_key()
         uid  = str(moderator_id)
@@ -597,6 +609,36 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         self._mod_actions[week][uid][action] = (
             self._mod_actions[week][uid].get(action, 0) + 1
         )
+        if link:
+            links_key = f"{action}_links"
+            self._mod_actions[week][uid].setdefault(links_key, [])
+            self._mod_actions[week][uid][links_key].append(link)
+        _save(MOD_ACTIONS_FILE, self._mod_actions)
+
+    def _remove_action(self, moderator_id: int, action: str, link: Optional[str] = None) -> None:
+        """Decrement the action counter and remove the evidence link (for deletions)."""
+        self._mod_actions = _load(MOD_ACTIONS_FILE)
+        uid = str(moderator_id)
+        links_key = f"{action}_links"
+        for week_data in self._mod_actions.values():
+            uid_data = week_data.get(uid, {})
+            # Locate the correct week by matching the link (if provided)
+            if link:
+                stored_links = uid_data.get(links_key, [])
+                if link not in stored_links:
+                    continue
+                stored_links.remove(link)
+                if not stored_links:
+                    uid_data.pop(links_key, None)
+            elif action not in uid_data:
+                continue
+            # Decrement count
+            if action in uid_data:
+                uid_data[action] = max(0, uid_data[action] - 1)
+                if uid_data[action] == 0:
+                    uid_data.pop(action, None)
+            _save(MOD_ACTIONS_FILE, self._mod_actions)
+            return
         _save(MOD_ACTIONS_FILE, self._mod_actions)
 
     # ------------------------------------------------------------------ #
@@ -678,17 +720,22 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         embed.add_field(name="🛡️  Moderator",     value=mod_embed_value,                inline=True)
         embed.add_field(name="📋  Reason",        value=str(data.get("reason") or "No reason provided."), inline=False)
         embed.add_field(name="🔗  Source",        value=f"[Jump to original log]({src.jump_url})", inline=False)
+
+        # Embed moderator ID + action key in footer so modlogdelete can reverse the stat
+        final_mod_id = mod_id or (resolved_member.id if resolved_member else 0)
         embed.set_footer(
-            text=f"Logged from #{src.channel.name}  •  {now.strftime('%d %b %Y, %H:%M UTC')}",
+            text=(
+                f"Logged from #{src.channel.name}  •  {now.strftime('%d %b %Y, %H:%M UTC')}"
+                f"  ║  mod:{final_mod_id}  ║  act:{action}"
+            ),
             icon_url=self.bot.user.display_avatar.url,
         )
-        await log_ch.send(embed=embed)
+        log_msg = await log_ch.send(embed=embed)
 
-        # Record the action against the moderator's stat counter
-        if mod_id:
-            self._record_action(mod_id, action)
-        elif resolved_member:
-            self._record_action(resolved_member.id, action)
+        # Record the action against the moderator's stat counter, storing the log link as evidence
+        record_id = mod_id or (resolved_member.id if resolved_member else None)
+        if record_id:
+            self._record_action(record_id, action, link=log_msg.jump_url)
 
     # ------------------------------------------------------------------ #
     # Role-change listener (promotion / demotion auto-log)                 #
@@ -810,9 +857,15 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         if not ch:
             return
 
-        now       = datetime.now(timezone.utc)
-        week_data = self._mod_actions.get(week_key, {})
-        staff_ids = self._cfg_list("STAFF_IDS") or [int(k) for k in week_data if k.isdigit()]
+        now = datetime.now(timezone.utc)
+
+        # Resolve staff members from roles (not STAFF_IDS, which may be role IDs)
+        role_map      = self._staff_role_map()
+        staff_role_ids = set(role_map.values())
+        staff_members: List[discord.Member] = []
+        for member in ch.guild.members:
+            if {r.id for r in member.roles} & staff_role_ids:
+                staff_members.append(member)
 
         header = discord.Embed(
             title=f"📊  Weekly Moderation Activity Report  {title_suffix}".strip(),
@@ -829,31 +882,19 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         )
         await ch.send(embed=header)
 
-        if not staff_ids:
+        if not staff_members:
             await ch.send(embed=discord.Embed(
-                description="No moderation activity recorded for this period.",
+                description="No staff members found with configured roles.",
                 color=0x95A5A6,
             ))
             return
 
-        for uid in staff_ids:
-            try:
-                member = ch.guild.get_member(uid) or await ch.guild.fetch_member(uid)
-            except discord.NotFound:
-                continue
-
-            actions      = week_data.get(str(uid), {})
+        for member in staff_members:
+            actions      = self._week_actions(member.id, week_key)
             total        = sum(actions.values())
             rank         = self._member_rank(member)
             rank_display = f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Staff"
-
-            # Show ALL action types with their counts (including 0)
-            breakdown_lines = []
-            for a in ALL_ACTIONS:
-                count = actions.get(a, 0)
-                breakdown_lines.append(
-                    f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}"
-                )
+            tir          = self._time_in_rank(member.id, rank) if rank else None
 
             embed = discord.Embed(
                 title=f"Staff Activity — {member.display_name}",
@@ -867,13 +908,39 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             embed.add_field(name="👤  Staff Member",  value=member.mention,   inline=True)
             embed.add_field(name="🏅  Rank",          value=rank_display,     inline=True)
             embed.add_field(name="📈  Total Actions", value=str(total),       inline=True)
-            embed.add_field(
-                name="📋  Actions This Week",
-                value="\n".join(breakdown_lines),
-                inline=False,
-            )
+            if rank and tir:
+                embed.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
+
+            # Per-action breakdown with evidence links
+            for a in ALL_ACTIONS:
+                count = actions.get(a, 0)
+                links = self._week_links(member.id, week_key, a)
+                if count == 0 and not links:
+                    # Show the action but with 0 and no links
+                    embed.add_field(
+                        name=f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}",
+                        value=f"**0**",
+                        inline=True,
+                    )
+                else:
+                    # Build evidence link list (cap at 10 to stay within field limit)
+                    if links:
+                        shown    = links[:10]
+                        overflow = len(links) - 10
+                        link_str = "\n".join(f"[Log {i+1}]({url})" for i, url in enumerate(shown))
+                        if overflow > 0:
+                            link_str += f"\n*…and {overflow} more*"
+                        value = f"**{count}**\n{link_str}"
+                    else:
+                        value = f"**{count}**"
+                    embed.add_field(
+                        name=f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}",
+                        value=value,
+                        inline=True,
+                    )
+
             embed.set_footer(
-                text=f"User ID: {uid}  ·  Period: {period_label}",
+                text=f"User ID: {member.id}  ·  Period: {period_label}",
                 icon_url=self.bot.user.display_avatar.url,
             )
             await ch.send(embed=embed)
@@ -1558,7 +1625,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             await ctx.send(
                 embed=discord.Embed(
                     description=(
-                        f"❌ That message doesn't appear to be a mod log entry posted by me.\n"
+                        "❌ That message doesn't appear to be a mod log entry posted by me.\n"
                         "Deletion aborted."
                     ),
                     color=0xE74C3C,
@@ -1567,7 +1634,20 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             )
             return
 
+        # Extract moderator ID + action from the footer we embedded at log time
+        log_embed   = target_msg.embeds[0]
+        footer_text = log_embed.footer.text or ""
+        mod_match   = re.search(r"║\s*mod:(\d+)", footer_text)
+        act_match   = re.search(r"║\s*act:(\w+)", footer_text)
+        stored_mod_id  = int(mod_match.group(1)) if mod_match else None
+        stored_action  = act_match.group(1) if act_match else None
+        log_jump_url   = target_msg.jump_url
+
         await target_msg.delete()
+
+        # Reverse the stat — decrement count and remove evidence link
+        if stored_mod_id and stored_action:
+            self._remove_action(stored_mod_id, stored_action, link=log_jump_url)
 
         # Also try to delete the invoking command message for cleanliness
         try:
@@ -1575,13 +1655,20 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         except discord.Forbidden:
             pass
 
+        now = datetime.now(timezone.utc)
         confirm = discord.Embed(
             title="🗑️  Mod Log Deleted",
-            description=f"Message `{message_id}` has been removed from {ch.mention}.",
             color=0x95A5A6,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now,
         )
-        confirm.add_field(name="Deleted by", value=ctx.author.mention, inline=True)
+        confirm.add_field(name="Channel",    value=ch.mention,          inline=True)
+        confirm.add_field(name="Deleted by", value=ctx.author.mention,  inline=True)
+        if stored_action:
+            confirm.add_field(
+                name="Stats updated",
+                value=f"Removed 1 **{ACTION_LABELS.get(stored_action, stored_action)}** from <@{stored_mod_id}>'s count." if stored_mod_id else "Could not resolve moderator — stats unchanged.",
+                inline=False,
+            )
         confirm.set_footer(
             text=f"Deleted by {ctx.author}",
             icon_url=ctx.author.display_avatar.url,
@@ -1636,46 +1723,33 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             )
             return
 
-        now      = datetime.now(timezone.utc)
-        staff_ids = self._cfg_list("STAFF_IDS")
+        now = datetime.now(timezone.utc)
 
-        # Build scores dict {user_id: count}
+        # Resolve staff members from roles (STAFF_IDS in this server's config
+        # are actually role IDs, so we look up by roles, not STAFF_IDS)
+        role_map       = self._staff_role_map()
+        staff_role_ids = set(role_map.values())
+        staff_members_lb: List[discord.Member] = []
+        if ctx.guild:
+            for m in ctx.guild.members:
+                if {r.id for r in m.roles} & staff_role_ids:
+                    staff_members_lb.append(m)
+
+        # Build scores dict {member: count}
         scores: Dict[int, int] = {}
 
         if scope == "week":
-            week_key  = self._week_key()
-            week_data = self._mod_actions.get(week_key, {})
-            # Include any IDs that have data this week even if not in STAFF_IDS
-            all_ids   = list({*staff_ids, *(int(k) for k in week_data if k.isdigit())})
-            for uid in all_ids:
-                actions = week_data.get(str(uid), {})
-                if action == "total":
-                    scores[uid] = sum(actions.values())
-                else:
-                    scores[uid] = actions.get(action, 0)
+            week_key = self._week_key()
+            for m in staff_members_lb:
+                acts = self._week_actions(m.id, week_key)
+                scores[m.id] = acts.get(action, 0) if action != "total" else sum(acts.values())
         else:
-            # All-time
-            all_ids = list({*staff_ids, *(int(k) for week in self._mod_actions.values() for k in week if k.isdigit())})
-            for uid in all_ids:
-                totals = self._lifetime_totals(uid)
-                if action == "total":
-                    scores[uid] = sum(totals.values())
-                else:
-                    scores[uid] = totals.get(action, 0)
+            for m in staff_members_lb:
+                totals = self._lifetime_totals(m.id)
+                scores[m.id] = totals.get(action, 0) if action != "total" else sum(totals.values())
 
-        # Sort descending; remove anyone with 0 for cleaner output (keep at least 1 entry)
+        # Sort descending
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        # Filter to staff only — skip non-staff IDs that snuck in from week_data
-        staff_id_set = set(staff_ids) if staff_ids else None
-
-        filtered: List[tuple] = []
-        for uid, count in ranked:
-            if staff_id_set and uid not in staff_id_set:
-                continue
-            filtered.append((uid, count))
-
-        if not filtered:
-            filtered = ranked  # fallback: show everyone if no STAFF_IDS configured
 
         # Medal emojis for top 3
         medals = ["🥇", "🥈", "🥉"]
@@ -1690,11 +1764,12 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             timestamp=now,
         )
 
-        # Resolve display names in bulk from cache
+        # Build display lines using cached member objects
+        member_map = {m.id: m for m in staff_members_lb}
         lines: List[str] = []
-        for pos, (uid, count) in enumerate(filtered, start=1):
+        for pos, (uid, count) in enumerate(ranked, start=1):
             medal    = medals[pos - 1] if pos <= 3 else f"`#{pos}`"
-            member   = ctx.guild.get_member(uid) if ctx.guild else None
+            member   = member_map.get(uid) or (ctx.guild.get_member(uid) if ctx.guild else None)
             name     = member.display_name if member else f"<@{uid}>"
             rank     = self._member_rank(member) if member else None
             rank_str = f" {RANK_EMOJIS.get(rank, '')} {rank}" if rank else ""
