@@ -1623,14 +1623,22 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         self,
         ctx: commands.Context,
         action: str,
-        user: discord.User,
+        target: discord.User,
+        moderator: Optional[discord.Member] = None,
         *,
         reason: str = "No reason provided.",
     ) -> None:
         """
         Manually log a mod action (for bots other than Dyno).
-        Usage: !modlog <action> <@user> [reason]
-        Actions: warn mute kick ban softban note
+        Usage: !modlog <action> <@target> [@moderator] [reason]
+          action    — warn · mute · kick · ban · softban · note
+          target    — the user being punished (required)
+          moderator — who gets the credit (optional, defaults to you)
+          reason    — reason for the action (optional)
+
+        Examples:
+          !modlog ban @BadUser Spamming
+          !modlog warn @BadUser @Will reason goes here
         """
         action = action.lower()
         if action not in ACTION_COLORS:
@@ -1647,16 +1655,18 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 delete_after=10,
             )
             return
+
+        mod = moderator or ctx.author
         data = {
             "action":       action,
-            "user_id":      user.id,
-            "user_tag":     str(user),
-            "moderator":    str(ctx.author),
-            "moderator_id": ctx.author.id,
+            "user_id":      target.id,
+            "user_tag":     str(target),
+            "moderator":    str(mod),
+            "moderator_id": mod.id,
             "reason":       reason,
         }
         await self._post_mod_action(ch, data, ctx.message)
-        self._record_action(ctx.author.id, action)
+        self._record_action(mod.id, action)
         await ctx.message.add_reaction("✅")
 
     @commands.command(name="staffstats")
