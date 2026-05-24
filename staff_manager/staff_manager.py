@@ -38,6 +38,9 @@ import discord
 from discord import ui
 from discord.ext import commands, tasks
 
+from core import checks
+from core.models import PermissionLevel
+
 # ---------------------------------------------------------------------------
 # Constants & file paths
 # ---------------------------------------------------------------------------
@@ -1421,6 +1424,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     # ------------------------------------------------------------------ #
 
     @commands.command(name="inactivityreq", aliases=["loa", "loareq"])
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def inactivity_request(
         self, ctx: commands.Context, duration: str, *, reason: str
     ) -> None:
@@ -1522,6 +1526,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             pass
 
     @commands.command(name="promotionreq", aliases=["promote", "promoapp"])
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def promotion_request(self, ctx: commands.Context, *, reason: str) -> None:
         """
         Submit a promotion request.
@@ -1629,7 +1634,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             pass
 
     @commands.command(name="modlog")
-    @commands.has_permissions(kick_members=True)
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def manual_mod_log(
         self,
         ctx: commands.Context,
@@ -1680,6 +1685,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.message.add_reaction("✅")
 
     @commands.command(name="staffstats")
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def staff_stats(
         self,
         ctx: commands.Context,
@@ -1761,7 +1767,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=embed)
 
     @commands.command(name="staffactivity", aliases=["activityreport", "weeklyreport"])
-    @commands.has_permissions(kick_members=True)
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def staff_activity(
         self,
         ctx: commands.Context,
@@ -1811,7 +1817,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         )
 
     @commands.command(name="modlogdelete", aliases=["delmodlog", "deletemodlog", "modlogdel"])
-    @commands.has_permissions(kick_members=True)
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def modlog_delete(
         self,
         ctx: commands.Context,
@@ -1920,7 +1926,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=confirm, delete_after=15)
 
     @commands.command(name="modlogreset", aliases=["resetmodlog", "clearmodlog", "modlogclear"])
-    @commands.has_permissions(kick_members=True)
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def modlog_reset(
         self,
         ctx: commands.Context,
@@ -1993,7 +1999,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=embed, delete_after=20)
 
     @commands.command(name="modstatsreset", aliases=["resetstats", "clearstats", "statsreset"])
-    @commands.has_permissions(kick_members=True)
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def modstats_reset(
         self,
         ctx: commands.Context,
@@ -2040,6 +2046,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=embed, delete_after=20)
 
     @commands.command(name="staffleaderboard", aliases=["leaderboard", "lb", "topmods"])
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def staff_leaderboard(
         self,
         ctx: commands.Context,
