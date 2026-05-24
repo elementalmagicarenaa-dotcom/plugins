@@ -22,7 +22,7 @@ Environment variables (set with ?config set KEY VALUE in Modmail):
   HEAD_OF_STAFF_ROLE_ID
   ADMIN_ROLE_ID
   HEAD_ADMIN_ROLE_ID
-  WEEKLY_REPORT_HOUR            UTC hour for Monday report (default: 9)
+  WEEKLY_REPORT_HOUR            (unused) Report now fires Sunday 00:00 GMT+8 (Saturday 16:00 UTC)
 """
 
 from __future__ import annotations
@@ -996,23 +996,23 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
 
     @tasks.loop(minutes=5)
     async def weekly_report_task(self) -> None:
+        # Fires every Sunday at 16:00 UTC = Monday 00:00 AM GMT+8
         now = datetime.now(timezone.utc)
-        if now.weekday() != 0:
+        if now.weekday() != 6:   # 6 = Sunday UTC
             return
-        target_hour = int(self._cfg("WEEKLY_REPORT_HOUR", "9") or 9)
-        if now.hour != target_hour:
+        if now.hour != 16:
             return
         today = now.strftime("%Y-%m-%d")
         if self._last_report_date == today:
             return
         self._last_report_date = today
-        # Automatic report covers last week's data
-        last_week_dt = now - timedelta(days=7)
-        week         = self._week_key(last_week_dt)
-        last_monday  = (last_week_dt - timedelta(days=last_week_dt.weekday())).replace(
+        # Report covers the previous Monday–Sunday week (GMT+8 perspective)
+        last_week_dt  = now - timedelta(days=7)
+        week          = self._week_key(last_week_dt)
+        last_monday   = (last_week_dt - timedelta(days=last_week_dt.weekday())).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        last_sunday  = last_monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        last_sunday   = last_monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
         await self._post_activity_report(
             period_label=f"{ts(last_monday, 'D')} — {ts(last_sunday, 'D')}",
             week_key=week,
@@ -1039,6 +1039,9 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
         if not ch:
             return
+
+        # Always reload from disk so the report reflects the latest recorded actions
+        self._mod_actions = _load(MOD_ACTIONS_FILE)
 
         now = datetime.now(timezone.utc)
 
@@ -1405,6 +1408,14 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 promo.set_footer(text=f"User ID: {uid}", icon_url=self.bot.user.display_avatar.url)
                 await log_ch.send(embed=promo)
 
+            # Reset the promoted staff member's stats across all weeks
+            if uid:
+                self._mod_actions = _load(MOD_ACTIONS_FILE)
+                uid_str = str(uid)
+                for week_data in self._mod_actions.values():
+                    week_data.pop(uid_str, None)
+                _save(MOD_ACTIONS_FILE, self._mod_actions)
+
     # ------------------------------------------------------------------ #
     # Commands                                                             #
     # ------------------------------------------------------------------ #
@@ -1675,20 +1686,25 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         member: Optional[discord.Member] = None,
     ) -> None:
         """
-        Show all-time mod action stats for a staff member.
+        Show this week's and all-time mod action stats for a staff member.
         Usage: !staffstats [@member]
         """
         target = member or ctx.author  # type: ignore[assignment]
-        totals = self._lifetime_totals(target.id)
-        rank   = self._member_rank(target)  # type: ignore[arg-type]
-        now    = datetime.now(timezone.utc)
-        total  = sum(totals.values())
 
-        # Show ALL action types with their counts (including 0)
-        lines = [
-            f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {totals.get(a, 0)}"
-            for a in ALL_ACTIONS
-        ]
+        # Always use fresh data from disk
+        self._mod_actions = _load(MOD_ACTIONS_FILE)
+
+        now      = datetime.now(timezone.utc)
+        week_key = self._week_key()
+        rank     = self._member_rank(target)  # type: ignore[arg-type]
+
+        # --- This week ---
+        week_actions = self._week_actions(target.id, week_key)
+        week_total   = sum(week_actions.values())
+
+        # --- All-time ---
+        totals       = self._lifetime_totals(target.id)
+        all_total    = sum(totals.values())
 
         embed = discord.Embed(
             title=f"📊  Staff Statistics — {target.display_name}",
@@ -1697,19 +1713,51 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         )
         embed.set_author(name=str(target), icon_url=target.display_avatar.url)
         embed.add_field(
-            name="Rank",
+            name="🏅  Rank",
             value=f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Not staff",
             inline=True,
         )
-        embed.add_field(name="Total Actions", value=str(total), inline=True)
-        embed.add_field(name="All-Time Breakdown", value="\n".join(lines), inline=False)
+        embed.add_field(name="📅  This Week",  value=str(week_total), inline=True)
+        embed.add_field(name="📈  All-Time",   value=str(all_total),  inline=True)
 
         if rank:
             tir = self._time_in_rank(target.id, rank)
             if tir:
-                embed.add_field(name=f"Time as {rank}", value=format_duration(tir), inline=False)
+                embed.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
 
-        embed.set_footer(text=f"User ID: {target.id}", icon_url=self.bot.user.display_avatar.url)
+        # --- This week breakdown with evidence links ---
+        week_lines = []
+        for a in ALL_ACTIONS:
+            count = week_actions.get(a, 0)
+            links = self._week_links(target.id, week_key, a)
+            if links:
+                shown    = links[:5]
+                overflow = len(links) - 5
+                link_str = "  " + "  ".join(f"[{i+1}]({u})" for i, u in enumerate(shown))
+                if overflow > 0:
+                    link_str += f" *+{overflow}*"
+                week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}{link_str}")
+            else:
+                week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}")
+
+        embed.add_field(
+            name="📋  This Week Breakdown",
+            value="\n".join(week_lines),
+            inline=False,
+        )
+
+        # --- All-time breakdown ---
+        alltime_lines = [
+            f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {totals.get(a, 0)}"
+            for a in ALL_ACTIONS
+        ]
+        embed.add_field(
+            name="🗂️  All-Time Breakdown",
+            value="\n".join(alltime_lines),
+            inline=False,
+        )
+
+        embed.set_footer(text=f"User ID: {target.id}  ·  Week: {week_key}", icon_url=self.bot.user.display_avatar.url)
         await ctx.send(embed=embed)
 
     @commands.command(name="staffactivity", aliases=["activityreport", "weeklyreport"])
