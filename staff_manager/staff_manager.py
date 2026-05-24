@@ -797,9 +797,10 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         log_ch = self._channel("MOD_ACTION_LOG_CHANNEL")
         if not log_ch:
             return
+        TRACKED_ACTIONS = {"warn", "mute", "kick", "ban", "softban"}
         for embed in message.embeds:
             data = _parse_dyno_embed(embed)
-            if data:
+            if data and data["action"] in TRACKED_ACTIONS:
                 await self._post_mod_action(log_ch, data, message)
                 break  # only log the first valid action embed per message
 
