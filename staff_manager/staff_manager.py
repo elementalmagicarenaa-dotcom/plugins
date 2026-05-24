@@ -1863,7 +1863,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=confirm, delete_after=15)
 
     @commands.command(name="modlogreset", aliases=["resetmodlog", "clearmodlog", "modlogclear"])
-    @commands.has_permissions(administrator=True)
+    @commands.has_permissions(kick_members=True)
     async def modlog_reset(
         self,
         ctx: commands.Context,
@@ -1936,7 +1936,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=embed, delete_after=20)
 
     @commands.command(name="modstatsreset", aliases=["resetstats", "clearstats", "statsreset"])
-    @commands.has_permissions(administrator=True)
+    @commands.has_permissions(kick_members=True)
     async def modstats_reset(
         self,
         ctx: commands.Context,
