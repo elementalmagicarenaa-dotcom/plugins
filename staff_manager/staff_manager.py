@@ -425,14 +425,46 @@ class AttachEvidenceModal(ui.Modal, title="📎  Attach Evidence"):
 
         embed = msg.embeds[0].copy()
 
-        # Build the evidence line — clickable label or bare URL
+        # ── Create or reuse a thread on the log message ──────────────────
+        thread: Optional[discord.Thread] = None
+
+        # Check if a thread already exists on this message
+        if isinstance(msg.channel, discord.TextChannel):
+            existing_thread = msg.thread  # non-None if already has a thread
+            if existing_thread:
+                thread = existing_thread
+            else:
+                # Derive a short name from the embed title
+                embed_title = embed.title or "Mod Log"
+                # strip the icon prefix (e.g. "⚠️  Moderation Action — Warn" → "Evidence — Warn")
+                action_part = embed_title.split("—")[-1].strip() if "—" in embed_title else embed_title
+                thread_name = f"Evidence — {action_part}"[:100]
+                try:
+                    thread = await msg.create_thread(
+                        name=thread_name,
+                        auto_archive_duration=10080,  # 7 days
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    thread = None  # silently continue without a thread
+
+        # ── Post evidence into the thread ─────────────────────────────────
+        if thread:
+            submitter = interaction.user
+            note_part = f"**{discord.utils.escape_markdown(raw_note)}**\n" if raw_note else ""
+            await thread.send(
+                f"📎 Evidence attached by {submitter.mention}\n"
+                f"{note_part}{raw_url}"
+            )
+
+        # ── Update the embed with a link to the thread ────────────────────
+        thread_ref = f" · [View thread](<https://discord.com/channels/{msg.guild.id}/{thread.id}>)" if thread else ""
         line = f"[{discord.utils.escape_markdown(raw_note)}]({raw_url})" if raw_note else raw_url
 
-        # Find an existing Evidence field and append, or add a new one
         evidence_idx = next(
             (i for i, f in enumerate(embed.fields) if "evidence" in (f.name or "").lower()),
             None,
         )
+        field_name = f"🔍  Evidence{thread_ref}" if thread else "🔍  Evidence"
         if evidence_idx is not None:
             existing = embed.fields[evidence_idx].value or ""
             embed.set_field_at(
@@ -442,11 +474,12 @@ class AttachEvidenceModal(ui.Modal, title="📎  Attach Evidence"):
                 inline=False,
             )
         else:
-            embed.add_field(name="🔍  Evidence", value=line, inline=False)
+            embed.add_field(name=field_name, value=line, inline=False)
 
         await msg.edit(embed=embed)
         await interaction.response.send_message(
-            f"✅ Evidence attached to the log!", ephemeral=True
+            f"✅ Evidence attached{' and posted in the thread' if thread else ''}!",
+            ephemeral=True,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
