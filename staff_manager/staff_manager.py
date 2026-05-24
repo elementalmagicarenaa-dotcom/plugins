@@ -1765,17 +1765,17 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     async def staff_activity(
         self,
         ctx: commands.Context,
-        week_offset: int = 1,
+        week_offset: int = 0,
     ) -> None:
         """
         Manually post the full staff activity report to the activity log channel.
         Posts stats for EVERY staff member in STAFF_IDS for the selected week.
         Usage: !staffactivity [week_offset]
-          week_offset: 1 = last week (default), 0 = current week, 2 = two weeks ago
+          week_offset: 0 = current week (default), 1 = last week, 2 = two weeks ago
 
         Examples:
-          !staffactivity        — posts last week's report (default)
-          !staffactivity 0      — posts the current (ongoing) week
+          !staffactivity        — posts the current (ongoing) week (default)
+          !staffactivity 1      — posts last week's report
           !staffactivity 2      — posts two weeks ago
         """
         ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
