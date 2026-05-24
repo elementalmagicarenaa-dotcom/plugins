@@ -1666,7 +1666,6 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             "reason":       reason,
         }
         await self._post_mod_action(ch, data, ctx.message)
-        self._record_action(mod.id, action)
         await ctx.message.add_reaction("✅")
 
     @commands.command(name="staffstats")
