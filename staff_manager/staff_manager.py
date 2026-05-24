@@ -74,85 +74,79 @@ RANK_EMOJIS: Dict[str, str] = {
 }
 
 ACTION_COLORS: Dict[str, int] = {
-    "warn":        0xF1C40F,
-    "mute":        0xE67E22,
-    "unmute":      0x2ECC71,
-    "kick":        0xE74C3C,
-    "ban":         0x992D22,
-    "unban":       0x1ABC9C,
-    "softban":     0xC0392B,
-    "deafen":      0x9B59B6,
-    "undeafen":    0xAED6F1,
-    "voicemute":   0xD35400,
-    "voiceunmute": 0x27AE60,
-    "note":        0x95A5A6,
+    "warn":    0xF1C40F,
+    "mute":    0xE67E22,
+    "kick":    0xE74C3C,
+    "ban":     0x992D22,
+    "softban": 0xC0392B,
+    "note":    0x95A5A6,
 }
 
 ACTION_ICONS: Dict[str, str] = {
-    "warn":        "⚠️",
-    "mute":        "🔇",
-    "unmute":      "🔊",
-    "kick":        "👟",
-    "ban":         "🔨",
-    "unban":       "🔓",
-    "softban":     "🪃",
-    "deafen":      "🎧",
-    "undeafen":    "🎙️",
-    "voicemute":   "🎤",
-    "voiceunmute": "📣",
-    "note":        "📝",
+    "warn":    "⚠️",
+    "mute":    "🔇",
+    "kick":    "👟",
+    "ban":     "🔨",
+    "softban": "🪃",
+    "note":    "📝",
 }
 
-# Keywords found in Dyno embed titles mapped to a normalised action key.
-# NOTE: These must be *action* verbs (past tense preferred).
-# Lookup / list embeds (e.g. "?warnings @user") are excluded separately.
+# Keywords that appear in Dyno embed text (title / author / description) mapped
+# to a normalised action key.  Longer phrases are checked first to prevent
+# partial matches.  Only *punitive* actions are tracked — no "un-" reversal
+# actions and no VC actions.
 DYNO_TITLE_MAP: Dict[str, str] = {
-    "member warned":    "warn",
-    "warned":           "warn",
-    "member muted":     "mute",
-    "muted":            "mute",
-    "member unmuted":   "unmute",
-    "unmuted":          "unmute",
-    "member kicked":    "kick",
-    "kicked":           "kick",
-    "member banned":    "ban",
-    "banned":           "ban",
-    "member unbanned":  "unban",
-    "unbanned":         "unban",
-    "softbanned":       "softban",
-    "member softbanned":"softban",
-    "deafened":         "deafen",
-    "undeafened":       "undeafen",
-    "voice muted":      "voicemute",
-    "voice unmuted":    "voiceunmute",
-    "noted":            "note",
-    "note added":       "note",
+    # --- warn ---
+    "member warned":     "warn",
+    "user warned":       "warn",
+    "warned":            "warn",
+    "warn":              "warn",
+    # --- mute ---
+    "member muted":      "mute",
+    "user muted":        "mute",
+    "muted":             "mute",
+    "mute":              "mute",
+    # --- kick ---
+    "member kicked":     "kick",
+    "user kicked":       "kick",
+    "kicked":            "kick",
+    "kick":              "kick",
+    # --- ban ---
+    "member banned":     "ban",
+    "user banned":       "ban",
+    "banned":            "ban",
+    "ban":               "ban",
+    # --- softban ---
+    "member softbanned": "softban",
+    "user softbanned":   "softban",
+    "softbanned":        "softban",
+    "softban":           "softban",
+    # --- note ---
+    "note added":        "note",
+    "noted":             "note",
+    "note":              "note",
 }
 
-# Patterns whose presence in the embed title indicates a *lookup* (not an action).
-# These take priority and cause the embed to be ignored.
+# Embed text patterns that indicate a *lookup/list* command, not a new action.
+# These are checked before DYNO_TITLE_MAP and will cause the embed to be skipped.
 _LOOKUP_PATTERNS = re.compile(
     r"infractions?\s+for\b"
     r"|warnings?\s+for\b"
     r"|warnings?\s+list"
     r"|modlogs?\s+for\b"
-    r"|cases?\s+for\b",
+    r"|cases?\s+for\b"
+    r"|\bunmuted?\b"
+    r"|\bunbanned?\b",
     re.IGNORECASE,
 )
 
 ACTION_LABELS: Dict[str, str] = {
-    "warn":        "Warnings",
-    "mute":        "Mutes",
-    "unmute":      "Unmutes",
-    "kick":        "Kicks",
-    "ban":         "Bans",
-    "unban":       "Unbans",
-    "softban":     "Softbans",
-    "deafen":      "Deafens",
-    "undeafen":    "Undeafens",
-    "voicemute":   "Voice Mutes",
-    "voiceunmute": "Voice Unmutes",
-    "note":        "Notes",
+    "warn":    "Warnings",
+    "mute":    "Mutes",
+    "kick":    "Kicks",
+    "ban":     "Bans",
+    "softban": "Softbans",
+    "note":    "Notes",
 }
 
 ALL_ACTIONS: List[str] = list(ACTION_LABELS.keys())
@@ -246,19 +240,27 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     """
     Return a dict with action/user_id/user_tag/moderator/moderator_id/reason, or None.
 
-    Returns None for lookup/list embeds (e.g. ?warnings, ?modlogs) so they
-    are never mistakenly logged as new mod actions.
+    Searches the embed title, author name, AND description so that Dyno embeds
+    are matched regardless of which field carries the action keyword.
+    Returns None for lookup/list embeds (e.g. ?warnings, ?modlogs).
     """
-    title = (embed.title or getattr(embed.author, "name", "") or "").lower()
+    # Collect all text that might carry the action keyword
+    title_str  = (embed.title or "").lower()
+    author_str = (getattr(embed.author, "name", "") or "").lower()
+    desc       = embed.description or ""
+    desc_lower = desc.lower()
 
-    # --- Exclude warning-check / infraction-list embeds (e.g. ?warnings @user) ---
-    if _LOOKUP_PATTERNS.search(title):
+    # Combined searchable text — checked for keywords
+    full_text = f"{title_str} {author_str} {desc_lower}"
+
+    # --- Exclude lookup / list embeds BEFORE action matching ---
+    if _LOOKUP_PATTERNS.search(full_text):
         return None
 
+    # --- Match action keyword (longest phrase first to avoid partial hits) ---
     action: Optional[str] = None
-    # Try longer keywords first to avoid partial matches
     for keyword in sorted(DYNO_TITLE_MAP, key=len, reverse=True):
-        if keyword in title:
+        if keyword in full_text:
             action = DYNO_TITLE_MAP[keyword]
             break
     if action is None:
@@ -269,74 +271,99 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
         "user_id":      None,
         "user_tag":     None,
         "moderator":    None,
-        "moderator_id": None,   # int ID if resolvable from a mention
+        "moderator_id": None,
         "reason":       "No reason provided.",
     }
 
-    def field_value(name: str) -> str:
-        nl = name.lower()
-        for f in embed.fields:
-            if nl in f.name.lower():
-                return f.value or ""
+    def field_value(*names: str) -> str:
+        """Return the value of the first embed field whose name contains any of the given strings."""
+        for name in names:
+            nl = name.lower()
+            for f in embed.fields:
+                if nl in f.name.lower():
+                    return f.value or ""
         return ""
 
-    desc = embed.description or ""
-
     # --- User ---
-    user_raw = field_value("user") or field_value("member") or field_value("target")
-    user_raw = re.sub(r"[<@!>]", "", user_raw).strip()
-    if user_raw:
-        id_m = re.search(r"\((\d{17,20})\)", user_raw)
-        if id_m:
-            result["user_id"] = int(id_m.group(1))
-        elif re.fullmatch(r"\d{17,20}", user_raw):
-            result["user_id"] = int(user_raw)
-        tag_part = re.sub(r"\s*\(\d+\)\s*$", "", user_raw).strip()
-        if tag_part:
-            result["user_tag"] = tag_part
+    user_raw = field_value("user", "member", "target")
+    # Also check description for user mentions if no field found
+    if not user_raw:
+        # Look for first mention in description that isn't obviously the moderator line
+        m_desc_user = re.search(r"<@!?(\d{17,20})>", desc)
+        if m_desc_user:
+            result["user_id"] = int(m_desc_user.group(1))
+    else:
+        # Field may contain "Username (123456789)" or just a mention
+        mention_in_field = re.search(r"<@!?(\d{17,20})>", user_raw)
+        if mention_in_field:
+            result["user_id"] = int(mention_in_field.group(1))
+        else:
+            cleaned = re.sub(r"[<@!>]", "", user_raw).strip()
+            id_paren = re.search(r"\((\d{17,20})\)", cleaned)
+            if id_paren:
+                result["user_id"] = int(id_paren.group(1))
+            elif re.fullmatch(r"\d{17,20}", cleaned):
+                result["user_id"] = int(cleaned)
+            tag_part = re.sub(r"\s*\(\d+\)\s*$", "", cleaned).strip()
+            if tag_part:
+                result["user_tag"] = tag_part
 
     if not result["user_id"]:
-        for pat in [r"User:\s*(?:<@!?)?(\d{17,20})>?",
-                    r"\*\*User:\*\*\s*(?:<@!?)?(\d{17,20})>?"]:
+        for pat in [
+            r"User:\s*<@!?(\d{17,20})>",
+            r"\*\*User:\*\*\s*<@!?(\d{17,20})>",
+            r"User:\s*(\d{17,20})",
+        ]:
             m2 = re.search(pat, desc, re.IGNORECASE)
             if m2:
                 result["user_id"] = int(m2.group(1))
                 break
 
     # --- Moderator ---
-    # Dyno typically puts moderator as a mention: <@123456789>.
-    # We extract the raw field value BEFORE stripping, look for a mention ID first.
-    mod_field_raw = (
-        field_value("responsible moderator")
-        or field_value("moderator")
-        or field_value("mod")
-        or field_value("staff")
+    # Try every plausible Dyno field name for the moderator.
+    mod_field_raw = field_value(
+        "responsible moderator", "moderator", "mod", "staff", "by", "executor"
     )
 
-    # Try to extract a bare mention ID from the raw field value
-    mention_id_m = re.search(r"<@!?(\d{17,20})>", mod_field_raw)
-    if mention_id_m:
-        result["moderator_id"] = int(mention_id_m.group(1))
+    # Priority 1: mention in a dedicated moderator field
+    if mod_field_raw:
+        m_mention = re.search(r"<@!?(\d{17,20})>", mod_field_raw)
+        if m_mention:
+            result["moderator_id"] = int(m_mention.group(1))
+        else:
+            cleaned_mod = re.sub(r"[<@!>]", "", mod_field_raw).strip()
+            if re.fullmatch(r"\d{17,20}", cleaned_mod):
+                result["moderator_id"] = int(cleaned_mod)
+            elif cleaned_mod:
+                result["moderator"] = cleaned_mod
 
-    # Also try to find an ID in the description
+    # Priority 2: mention in description on a "Moderator: <@id>" line
     if not result["moderator_id"]:
-        for pat in [r"(?:Responsible Moderator|Moderator):\s*<@!?(\d{17,20})>"]:
-            m3 = re.search(pat, desc, re.IGNORECASE)
-            if m3:
-                result["moderator_id"] = int(m3.group(1))
-                break
+        m3 = re.search(
+            r"(?:Responsible\s+)?Moderator[:\s]+<@!?(\d{17,20})>",
+            desc,
+            re.IGNORECASE,
+        )
+        if m3:
+            result["moderator_id"] = int(m3.group(1))
 
-    # Fallback display name (after stripping mention syntax)
-    mod_clean = re.sub(r"[<@!>]", "", mod_field_raw).strip()
-    if mod_clean:
-        result["moderator"] = mod_clean
-    else:
-        m4 = re.search(r"(?:Responsible Moderator|Moderator):\s*(.+)", desc, re.IGNORECASE)
-        if m4:
-            result["moderator"] = re.sub(r"[<@!>]", "", m4.group(1)).strip()
+    # Priority 3: any remaining mention in description (last resort — may be imprecise)
+    if not result["moderator_id"] and not result["moderator"]:
+        # Find all mentions in description; skip the user one if we know it
+        all_mentions = re.findall(r"<@!?(\d{17,20})>", desc)
+        user_id_str  = str(result.get("user_id") or "")
+        for mid in all_mentions:
+            if mid != user_id_str:
+                result["moderator_id"] = int(mid)
+                break
 
     # --- Reason ---
     reason_raw = field_value("reason")
+    if not reason_raw:
+        # Try parsing from description
+        m_reason = re.search(r"\*?\*?Reason\*?\*?[:\s]+(.+)", desc, re.IGNORECASE)
+        if m_reason:
+            reason_raw = m_reason.group(1).strip()
     if reason_raw:
         result["reason"] = reason_raw.strip() or "No reason provided."
 
@@ -1349,7 +1376,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         """
         Manually log a mod action (for bots other than Dyno).
         Usage: !modlog <action> <@user> [reason]
-        Actions: warn mute unmute kick ban unban softban deafen undeafen voicemute voiceunmute note
+        Actions: warn mute kick ban softban note
         """
         action = action.lower()
         if action not in ACTION_COLORS:
@@ -1427,16 +1454,18 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     async def staff_activity(
         self,
         ctx: commands.Context,
-        week_offset: int = 0,
+        week_offset: int = 1,
     ) -> None:
         """
-        Manually post the staff activity report to the activity log channel.
+        Manually post the full staff activity report to the activity log channel.
+        Posts stats for EVERY staff member in STAFF_IDS for the selected week.
         Usage: !staffactivity [week_offset]
-          week_offset: 0 = current week (default), 1 = last week, 2 = two weeks ago, etc.
+          week_offset: 1 = last week (default), 0 = current week, 2 = two weeks ago
 
         Examples:
-          !staffactivity        — posts current week's report
-          !staffactivity 1      — posts last week's report
+          !staffactivity        — posts last week's report (default)
+          !staffactivity 0      — posts the current (ongoing) week
+          !staffactivity 2      — posts two weeks ago
         """
         ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
         if not ch:
@@ -1470,6 +1499,95 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             title_suffix=suffix,
         )
 
+    @commands.command(name="modlogdelete", aliases=["delmodlog", "deletemodlog", "modlogdel"])
+    @commands.has_permissions(kick_members=True)
+    async def modlog_delete(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+    ) -> None:
+        """
+        Delete a mod log entry from the mod action log channel by message ID.
+        Usage: !modlogdelete <message_id>
+        Example: !modlogdelete 1234567890123456789
+
+        Requires kick_members permission. Right-click the log message → Copy ID.
+        """
+        ch = self._channel("MOD_ACTION_LOG_CHANNEL")
+        if not ch:
+            await ctx.send(
+                embed=discord.Embed(
+                    description="❌ Mod action log channel is not configured.",
+                    color=0xE74C3C,
+                ),
+                delete_after=10,
+            )
+            return
+
+        try:
+            target_msg = await ch.fetch_message(message_id)
+        except discord.NotFound:
+            await ctx.send(
+                embed=discord.Embed(
+                    description=(
+                        f"❌ Message `{message_id}` not found in {ch.mention}.\n"
+                        "Make sure you copied the ID from the correct channel."
+                    ),
+                    color=0xE74C3C,
+                ),
+                delete_after=12,
+            )
+            return
+        except discord.Forbidden:
+            await ctx.send(
+                embed=discord.Embed(
+                    description="❌ I don't have permission to read messages in that channel.",
+                    color=0xE74C3C,
+                ),
+                delete_after=10,
+            )
+            return
+
+        # Confirm it looks like one of our log embeds before deleting
+        is_our_log = (
+            target_msg.author.id == self.bot.user.id
+            and target_msg.embeds
+            and "Moderation Action" in (target_msg.embeds[0].title or "")
+        )
+        if not is_our_log:
+            await ctx.send(
+                embed=discord.Embed(
+                    description=(
+                        f"❌ That message doesn't appear to be a mod log entry posted by me.\n"
+                        "Deletion aborted."
+                    ),
+                    color=0xE74C3C,
+                ),
+                delete_after=12,
+            )
+            return
+
+        await target_msg.delete()
+
+        # Also try to delete the invoking command message for cleanliness
+        try:
+            await ctx.message.delete()
+        except discord.Forbidden:
+            pass
+
+        confirm = discord.Embed(
+            title="🗑️  Mod Log Deleted",
+            description=f"Message `{message_id}` has been removed from {ch.mention}.",
+            color=0x95A5A6,
+            timestamp=datetime.now(timezone.utc),
+        )
+        confirm.add_field(name="Deleted by", value=ctx.author.mention, inline=True)
+        confirm.set_footer(
+            text=f"Deleted by {ctx.author}",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await ctx.send(embed=confirm, delete_after=15)
+
     @commands.command(name="staffleaderboard", aliases=["leaderboard", "lb", "topmods"])
     async def staff_leaderboard(
         self,
@@ -1481,8 +1599,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         Show a ranked leaderboard of staff members by mod action count.
         Usage: !staffleaderboard [scope] [action]
           scope:  week (default) | alltime
-          action: total (default) | warn | mute | kick | ban | softban | unban |
-                  unmute | kick | deafen | undeafen | voicemute | voiceunmute | note
+          action: total (default) | warn | mute | kick | ban | softban | note
 
         Examples:
           !staffleaderboard                — this week, all action types combined
