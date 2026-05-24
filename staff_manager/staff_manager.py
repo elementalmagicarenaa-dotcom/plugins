@@ -658,6 +658,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             data = _parse_dyno_embed(embed)
             if data:
                 await self._post_mod_action(log_ch, data, message)
+                break  # only log the first valid action embed per message
 
     async def _post_mod_action(
         self,
@@ -859,13 +860,17 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
 
         now = datetime.now(timezone.utc)
 
-        # Resolve staff members from roles (not STAFF_IDS, which may be role IDs)
+        # Resolve staff members from roles — only up to Senior Moderator
+        # Staff Management and above are excluded from the activity report
+        ACTIVITY_RANKS = {"Trial Moderator", "Moderator", "Senior Moderator"}
         role_map      = self._staff_role_map()
         staff_role_ids = set(role_map.values())
         staff_members: List[discord.Member] = []
         for member in ch.guild.members:
             if {r.id for r in member.roles} & staff_role_ids:
-                staff_members.append(member)
+                rank = self._member_rank(member)
+                if rank in ACTIVITY_RANKS:
+                    staff_members.append(member)
 
         header = discord.Embed(
             title=f"📊  Weekly Moderation Activity Report  {title_suffix}".strip(),
