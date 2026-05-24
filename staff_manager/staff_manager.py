@@ -367,6 +367,14 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     if reason_raw:
         result["reason"] = reason_raw.strip() or "No reason provided."
 
+    # Reject confirmation / summary embeds that have no user AND no moderator info.
+    # These are simple one-line confirmations (e.g. "r3nj1_k has been warned.") that
+    # happen to contain an action keyword but carry no case data.
+    no_user = not result["user_id"] and not result["user_tag"]
+    no_mod  = not result["moderator_id"] and not result["moderator"]
+    if no_user and no_mod:
+        return None
+
     return result
 
 
@@ -1679,6 +1687,79 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             icon_url=ctx.author.display_avatar.url,
         )
         await ctx.send(embed=confirm, delete_after=15)
+
+    @commands.command(name="modlogreset", aliases=["resetmodlog", "clearmodlog", "modlogclear"])
+    @commands.has_permissions(administrator=True)
+    async def modlog_reset(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        scope: str = "week",
+    ) -> None:
+        """
+        Reset a staff member's mod action stats.
+        Usage: !modlogreset @member [week|alltime]
+          week    — clears only the current week's stats (default)
+          alltime — clears ALL weeks of stored data for this person
+
+        Examples:
+          !modlogreset @Will Serfort
+          !modlogreset @Will Serfort alltime
+        """
+        scope = scope.lower().strip()
+        if scope not in ("week", "alltime"):
+            await ctx.send(
+                embed=discord.Embed(
+                    description="❌ Invalid scope. Use `week` (default) or `alltime`.",
+                    color=0xE74C3C,
+                ),
+                delete_after=10,
+            )
+            return
+
+        self._mod_actions = _load(MOD_ACTIONS_FILE)
+        uid = str(member.id)
+        now = datetime.now(timezone.utc)
+
+        if scope == "week":
+            week_key = self._week_key()
+            week_data = self._mod_actions.get(week_key, {})
+            cleared = week_data.pop(uid, {})
+            if not any(k for k in cleared if not k.endswith("_links")):
+                cleared = {}
+            _save(MOD_ACTIONS_FILE, self._mod_actions)
+            total_removed = sum(v for k, v in cleared.items() if not k.endswith("_links") and isinstance(v, int))
+            scope_label = "this week"
+        else:
+            total_removed = 0
+            for week_data in self._mod_actions.values():
+                removed = week_data.pop(uid, {})
+                total_removed += sum(v for k, v in removed.items() if not k.endswith("_links") and isinstance(v, int))
+            _save(MOD_ACTIONS_FILE, self._mod_actions)
+            scope_label = "all time"
+
+        try:
+            await ctx.message.delete()
+        except discord.Forbidden:
+            pass
+
+        embed = discord.Embed(
+            title="🔄  Mod Stats Reset",
+            color=0xE67E22,
+            timestamp=now,
+        )
+        embed.set_author(
+            name=member.display_name,
+            icon_url=member.display_avatar.url,
+        )
+        embed.add_field(name="👤  Staff Member", value=member.mention,       inline=True)
+        embed.add_field(name="📅  Scope",        value=scope_label.title(),  inline=True)
+        embed.add_field(name="🗑️  Actions Removed", value=str(total_removed), inline=True)
+        embed.set_footer(
+            text=f"Reset by {ctx.author}",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await ctx.send(embed=embed, delete_after=20)
 
     @commands.command(name="staffleaderboard", aliases=["leaderboard", "lb", "topmods"])
     async def staff_leaderboard(
