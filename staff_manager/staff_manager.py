@@ -125,6 +125,25 @@ DYNO_TITLE_MAP: Dict[str, str] = {
     "note added":        "note",
     "noted":             "note",
     "note":              "note",
+    # --- reverse actions (decrement stats) ---
+    "member unbanned":   "unban",
+    "user unbanned":     "unban",
+    "unbanned":          "unban",
+    "unban":             "unban",
+    "member unmuted":    "unmute",
+    "user unmuted":      "unmute",
+    "unmuted":           "unmute",
+    "unmute":            "unmute",
+    "warning deleted":   "delwarn",
+    "warn deleted":      "delwarn",
+    "case deleted":      "delwarn",
+}
+
+# Maps a reverse action to the tracked action it should decrement
+REVERSE_ACTION_MAP: Dict[str, str] = {
+    "unban":   "ban",
+    "unmute":  "mute",
+    "delwarn": "warn",
 }
 
 # Embed text patterns that indicate a *lookup/list* command, not a new action.
@@ -134,9 +153,7 @@ _LOOKUP_PATTERNS = re.compile(
     r"|warnings?\s+for\b"
     r"|warnings?\s+list"
     r"|modlogs?\s+for\b"
-    r"|cases?\s+for\b"
-    r"|\bunmuted?\b"
-    r"|\bunbanned?\b",
+    r"|cases?\s+for\b",
     re.IGNORECASE,
 )
 
@@ -800,9 +817,30 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         TRACKED_ACTIONS = {"warn", "mute", "kick", "ban", "softban"}
         for embed in message.embeds:
             data = _parse_dyno_embed(embed)
-            if data and data["action"] in TRACKED_ACTIONS:
+            if not data:
+                continue
+            action = data["action"]
+            if action in TRACKED_ACTIONS:
                 await self._post_mod_action(log_ch, data, message)
                 break  # only log the first valid action embed per message
+            elif action in REVERSE_ACTION_MAP:
+                # Decrement the corresponding stat for the moderator
+                mod_id: Optional[int] = data.get("moderator_id")  # type: ignore[assignment]
+                mod_display: str = str(data.get("moderator") or "")
+                guild = log_ch.guild
+                if not mod_id and guild and mod_display:
+                    if re.fullmatch(r"\d{17,20}", mod_display):
+                        mod_id = int(mod_display)
+                    else:
+                        found = discord.utils.find(
+                            lambda m: m.display_name == mod_display or str(m) == mod_display,
+                            guild.members,
+                        )
+                        if found:
+                            mod_id = found.id
+                if mod_id:
+                    self._remove_action(mod_id, REVERSE_ACTION_MAP[action])
+                break
 
     async def _post_mod_action(
         self,
@@ -1891,6 +1929,53 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         embed.add_field(name="👤  Staff Member", value=member.mention,       inline=True)
         embed.add_field(name="📅  Scope",        value=scope_label.title(),  inline=True)
         embed.add_field(name="🗑️  Actions Removed", value=str(total_removed), inline=True)
+        embed.set_footer(
+            text=f"Reset by {ctx.author}",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await ctx.send(embed=embed, delete_after=20)
+
+    @commands.command(name="modstatsreset", aliases=["resetstats", "clearstats", "statsreset"])
+    @commands.has_permissions(administrator=True)
+    async def modstats_reset(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+    ) -> None:
+        """
+        Completely wipe ALL recorded mod stats for a staff member across every week.
+        Usage: !modstatsreset @member
+
+        Example:
+          !modstatsreset @Will Serfort
+        """
+        self._mod_actions = _load(MOD_ACTIONS_FILE)
+        uid = str(member.id)
+        now = datetime.now(timezone.utc)
+
+        total_removed = 0
+        for week_data in self._mod_actions.values():
+            removed = week_data.pop(uid, {})
+            total_removed += sum(
+                v for k, v in removed.items()
+                if not k.endswith("_links") and isinstance(v, int)
+            )
+        _save(MOD_ACTIONS_FILE, self._mod_actions)
+
+        try:
+            await ctx.message.delete()
+        except discord.Forbidden:
+            pass
+
+        embed = discord.Embed(
+            title="🗑️  Staff Stats Wiped",
+            description=f"All recorded mod actions for {member.mention} have been permanently removed.",
+            color=0xE74C3C,
+            timestamp=now,
+        )
+        embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+        embed.add_field(name="👤  Staff Member",     value=member.mention,       inline=True)
+        embed.add_field(name="🗑️  Actions Removed", value=str(total_removed),   inline=True)
         embed.set_footer(
             text=f"Reset by {ctx.author}",
             icon_url=ctx.author.display_avatar.url,
