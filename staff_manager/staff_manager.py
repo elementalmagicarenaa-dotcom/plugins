@@ -1495,8 +1495,20 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             icon_url=self.bot.user.display_avatar.url,
         )
 
+        # Determine who to ping based on the requester's rank
+        LOWER_RANKS = {"Trial Moderator", "Moderator", "Senior Moderator"}
+        if rank in LOWER_RANKS:
+            # Trial Mod / Mod / Senior Mod → ping Staff Management
+            ping_ids = [self._cfg_int("STAFF_MANAGEMENT_ROLE_ID")]
+        elif rank == "Staff Management":
+            # Staff Management → ping Head of Staff
+            ping_ids = [self._cfg_int("HEAD_OF_STAFF_ROLE_ID")]
+        else:
+            ping_ids = []
+        ping_text = " ".join(f"<@&{rid}>" for rid in ping_ids if rid) or None
+
         view = InactivityView(self, request_id)
-        msg  = await ch.send(embed=embed, view=view)
+        msg  = await ch.send(content=ping_text, embed=embed, view=view)
 
         self._inactivity[request_id] = {
             "user_id":      str(ctx.author.id),
