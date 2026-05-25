@@ -1009,18 +1009,20 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         if self._last_report_date == today:
             return
         self._last_report_date = today
-        # Report covers the previous Monday–Sunday week (GMT+8 perspective)
-        last_week_dt  = now - timedelta(days=7)
-        week          = self._week_key(last_week_dt)
-        last_monday   = (last_week_dt - timedelta(days=last_week_dt.weekday())).replace(
+        # Report covers the week that just ended (Mon–Sun GMT+8).
+        # The task fires on Sunday 16:00 UTC = Monday 00:00 GMT+8, so 'now' is
+        # still Sunday UTC — the final day of the week being summarised.
+        # Using 'now' for the week key correctly matches how _record_action stores data.
+        week        = self._week_key(now)
+        this_monday = (now - timedelta(days=now.weekday())).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        last_sunday   = last_monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        this_sunday = this_monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
         await self._post_activity_report(
-            period_label=f"{ts(last_monday, 'D')} — {ts(last_sunday, 'D')}",
+            period_label=f"{ts(this_monday, 'D')} — {ts(this_sunday, 'D')}",
             week_key=week,
-            week_dt=last_week_dt,
-            title_suffix="(Automatic — Previous Week)",
+            week_dt=now,
+            title_suffix="(Automatic — Weekly Report)",
         )
 
     @weekly_report_task.before_loop
