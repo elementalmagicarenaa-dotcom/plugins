@@ -1181,6 +1181,20 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                     await user.send(embed=dm)
                 except Exception:
                     pass
+            # Remove the inactivity role now that the LOA has ended
+            inactivity_role_id = self._cfg_int("INACTIVITY_ROLE_ID")
+            if inactivity_role_id and uid:
+                for guild in self.bot.guilds:
+                    member = guild.get_member(int(uid))
+                    if member:
+                        role = guild.get_role(inactivity_role_id)
+                        if role:
+                            try:
+                                await member.remove_roles(role, reason="LOA expired")
+                            except Exception:
+                                pass
+                        break
+
             req["notified"] = True
             changed = True
 
@@ -1230,6 +1244,21 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             td = parse_duration(req.get("raw_duration", ""))
             ends_at = now + (td if td else timedelta(days=14))
             req["ends_at"] = ends_at.isoformat()
+
+            # Assign the inactivity role to the member
+            inactivity_role_id = self._cfg_int("INACTIVITY_ROLE_ID")
+            uid_str = req.get("user_id")
+            if inactivity_role_id and uid_str:
+                for guild in self.bot.guilds:
+                    member = guild.get_member(int(uid_str))
+                    if member:
+                        role = guild.get_role(inactivity_role_id)
+                        if role:
+                            try:
+                                await member.add_roles(role, reason="LOA approved")
+                            except Exception:
+                                pass
+                        break
 
         _save(INACTIVITY_FILE, self._inactivity)
 
