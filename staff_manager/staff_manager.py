@@ -1354,6 +1354,22 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             )
             return
 
+        # Staff Management cannot accept a request for Staff Management rank —
+        # only Head of Staff and above may do so.
+        if accepted and req.get("desired_rank") == "Staff Management":
+            higher_ids = {
+                self._cfg_int("HEAD_OF_STAFF_ROLE_ID"),
+                self._cfg_int("ADMIN_ROLE_ID"),
+                self._cfg_int("HEAD_ADMIN_ROLE_ID"),
+            }
+            reviewer_rids = {r.id for r in getattr(interaction.user, "roles", [])}
+            if not reviewer_rids.intersection(higher_ids):
+                await interaction.response.send_message(
+                    "❌ Only **Head of Staff** and above can accept Staff Management promotion requests.",
+                    ephemeral=True,
+                )
+                return
+
         now = datetime.now(timezone.utc)
         req["status"]      = "accepted" if accepted else "declined"
         req["reviewed_by"] = str(interaction.user)
@@ -1622,7 +1638,8 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             for a in ALL_ACTIONS if totals.get(a, 0)
         ] or ["*No tracked mod actions yet.*"]
 
-        ping_text = " ".join(f"<@&{rid}>" for rid in self._cfg_list("HIGH_RANK_ROLE_IDS"))
+        # Only ping Staff Management and Head of Staff — not Admin/Head Admin
+        ping_text = " ".join(f"<@&{rid}>" for rid in self._cfg_list("PROMOTION_PING_ROLE_IDS"))
 
         embed = discord.Embed(title="🌟  Promotion Request", color=0xF1C40F, timestamp=now)
         embed.set_author(
