@@ -83,6 +83,7 @@ ACTION_COLORS: Dict[str, int] = {
     "ban":     0x992D22,
     "softban": 0xC0392B,
     "note":    0x95A5A6,
+    "ticket":  0x1ABC9C,
 }
 
 ACTION_ICONS: Dict[str, str] = {
@@ -92,7 +93,11 @@ ACTION_ICONS: Dict[str, str] = {
     "ban":     "🔨",
     "softban": "🪃",
     "note":    "📝",
+    "ticket":  "🎫",
 }
+
+# Actions that can be manually logged via !modlog (tickets are auto-tracked only)
+MANUAL_ACTIONS: set = {"warn", "mute", "kick", "ban", "softban", "note"}
 
 # Keywords that appear in Dyno embed text (title / author / description) mapped
 # to a normalised action key.  Longer phrases are checked first to prevent
