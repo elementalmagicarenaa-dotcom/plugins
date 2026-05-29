@@ -83,7 +83,6 @@ ACTION_COLORS: Dict[str, int] = {
     "ban":     0x992D22,
     "softban": 0xC0392B,
     "note":    0x95A5A6,
-    "ticket":  0x1ABC9C,
 }
 
 ACTION_ICONS: Dict[str, str] = {
@@ -93,11 +92,7 @@ ACTION_ICONS: Dict[str, str] = {
     "ban":     "🔨",
     "softban": "🪃",
     "note":    "📝",
-    "ticket":  "🎫",
 }
-
-# Actions that can be manually logged via !modlog (tickets are auto-tracked only)
-MANUAL_ACTIONS: set = {"warn", "mute", "kick", "ban", "softban", "note"}
 
 # Keywords that appear in Dyno embed text (title / author / description) mapped
 # to a normalised action key.  Longer phrases are checked first to prevent
@@ -1462,27 +1457,6 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 promo.add_field(name="Date",          value=ts(now, "F"),             inline=True)
                 promo.set_footer(text=f"User ID: {uid}", icon_url=self.bot.user.display_avatar.url)
                 await log_ch.send(embed=promo)
-
-            # Swap rank roles on the member
-            if uid:
-                role_map = self._staff_role_map()
-                old_role_id = role_map.get(current_rank)
-                new_role_id = role_map.get(desired_rank)
-                for guild in self.bot.guilds:
-                    member = guild.get_member(int(uid))
-                    if member:
-                        try:
-                            if new_role_id:
-                                new_role = guild.get_role(new_role_id)
-                                if new_role:
-                                    await member.add_roles(new_role, reason=f"Promoted to {desired_rank}")
-                            if old_role_id:
-                                old_role = guild.get_role(old_role_id)
-                                if old_role:
-                                    await member.remove_roles(old_role, reason=f"Promoted from {current_rank}")
-                        except Exception:
-                            pass
-                        break
 
             # Reset the promoted staff member's stats across all weeks
             if uid:
