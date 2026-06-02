@@ -1003,7 +1003,22 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                         break
 
             if closer_id:
-                self._record_action(closer_id, "ticket_close", link=message.jump_url)
+                log_ch = self._channel("MOD_ACTION_LOG_CHANNEL")
+                if log_ch:
+                    # Post a deletable log embed (just like Dyno actions) so
+                    # !modlogdelete can be used to reverse this stat.
+                    data = {
+                        "action":       "ticket_close",
+                        "user_id":      None,
+                        "user_tag":     "Ticket",
+                        "moderator_id": closer_id,
+                        "moderator":    None,
+                        "reason":       "Modmail ticket closed",
+                    }
+                    await self._post_mod_action(log_ch, data, message)
+                else:
+                    # No log channel configured — record stat directly
+                    self._record_action(closer_id, "ticket_close", link=message.jump_url)
             break  # only process the first matching embed per message
 
     async def _post_mod_action(
@@ -1889,14 +1904,15 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         """
         Manually log a mod action (for bots other than Dyno).
         Usage: !modlog <action> <@target> [@moderator] [reason]
-          action    — warn · mute · kick · ban · softban · note
-          target    — the user being punished (required)
+          action    — warn · mute · kick · ban · softban · note · ticket_close
+          target    — the user being actioned / ticket opener (required)
           moderator — who gets the credit (optional, defaults to you)
           reason    — reason for the action (optional)
 
         Examples:
           !modlog ban @BadUser Spamming
           !modlog warn @BadUser @Will reason goes here
+          !modlog ticket_close @User @Will closed manually
         """
         action = action.lower()
         if action not in ACTION_COLORS:
