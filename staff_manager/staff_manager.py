@@ -11,6 +11,7 @@ Environment variables (set with ?config set KEY VALUE in Modmail):
   INACTIVITY_CHANNEL            Channel ID for inactivity requests
   PROMOTION_REQUEST_CHANNEL     Channel ID for promotion requests
   PROMOTION_LOG_CHANNEL         Channel ID for promotion logs
+  TICKET_LOG_CHANNEL            Channel ID where Modmail posts thread-close embeds (for ticket close tracking)
   DYNO_ID                       Dyno user ID (default: 155149108183695360)
   STAFF_IDS                     Comma-separated staff user IDs
   STAFF_MANAGEMENT_ROLE_IDS     Role IDs that can approve LOA requests
@@ -77,21 +78,23 @@ RANK_EMOJIS: Dict[str, str] = {
 }
 
 ACTION_COLORS: Dict[str, int] = {
-    "warn":    0xF1C40F,
-    "mute":    0xE67E22,
-    "kick":    0xE74C3C,
-    "ban":     0x992D22,
-    "softban": 0xC0392B,
-    "note":    0x95A5A6,
+    "warn":         0xF1C40F,
+    "mute":         0xE67E22,
+    "kick":         0xE74C3C,
+    "ban":          0x992D22,
+    "softban":      0xC0392B,
+    "note":         0x95A5A6,
+    "ticket_close": 0x1ABC9C,
 }
 
 ACTION_ICONS: Dict[str, str] = {
-    "warn":    "⚠️",
-    "mute":    "🔇",
-    "kick":    "👟",
-    "ban":     "🔨",
-    "softban": "🪃",
-    "note":    "📝",
+    "warn":         "⚠️",
+    "mute":         "🔇",
+    "kick":         "👟",
+    "ban":          "🔨",
+    "softban":      "🪃",
+    "note":         "📝",
+    "ticket_close": "🎫",
 }
 
 # Keywords that appear in Dyno embed text (title / author / description) mapped
@@ -161,12 +164,13 @@ _LOOKUP_PATTERNS = re.compile(
 )
 
 ACTION_LABELS: Dict[str, str] = {
-    "warn":    "Warnings",
-    "mute":    "Mutes",
-    "kick":    "Kicks",
-    "ban":     "Bans",
-    "softban": "Softbans",
-    "note":    "Notes",
+    "warn":         "Warnings",
+    "mute":         "Mutes",
+    "kick":         "Kicks",
+    "ban":          "Bans",
+    "softban":      "Softbans",
+    "note":         "Notes",
+    "ticket_close": "Tickets Closed",
 }
 
 ALL_ACTIONS: List[str] = list(ACTION_LABELS.keys())
@@ -810,6 +814,12 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
+        # --- Ticket close tracking (Modmail log channel) ---
+        ticket_log_ch = self._channel("TICKET_LOG_CHANNEL")
+        if ticket_log_ch and message.channel.id == ticket_log_ch.id and message.embeds:
+            await self._handle_ticket_close(message)
+
+        # --- Dyno mod action tracking ---
         if message.author.id != self._dyno_id:
             return
         if not message.embeds:
@@ -844,6 +854,93 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 if mod_id:
                     self._remove_action(mod_id, REVERSE_ACTION_MAP[action])
                 break
+
+    async def _handle_ticket_close(self, message: discord.Message) -> None:
+        """
+        Parse a Modmail thread-close log embed and record a ticket_close stat
+        for whoever closed the ticket.
+
+        Modmail's close embed typically looks like one of:
+          • title "Thread Closed" with a "Closed by" field or footer
+          • description containing "Closed by <@id>" or "closed by Username"
+          • author name set to the closer's display name
+
+        We try each location in priority order and stop at the first hit.
+        """
+        for embed in message.embeds:
+            title_str = (embed.title or "").lower()
+            desc      = embed.description or ""
+            desc_lower = desc.lower()
+
+            # Only process embeds that look like a thread/ticket close
+            is_close = (
+                "thread closed" in title_str
+                or "ticket closed" in title_str
+                or "closed" in title_str
+                or "thread closed" in desc_lower
+            )
+            if not is_close:
+                continue
+
+            closer_id: Optional[int] = None
+
+            # Priority 1: explicit "Closed by" field with a mention
+            for field in embed.fields:
+                fname = (field.name or "").lower()
+                if "closed" in fname or "closer" in fname or "by" in fname:
+                    m = re.search(r"<@!?(\d{17,20})>", field.value or "")
+                    if m:
+                        closer_id = int(m.group(1))
+                        break
+
+            # Priority 2: mention in description on a "Closed by …" line
+            if not closer_id:
+                m = re.search(
+                    r"closed\s+by[:\s]+<@!?(\d{17,20})>",
+                    desc,
+                    re.IGNORECASE,
+                )
+                if m:
+                    closer_id = int(m.group(1))
+
+            # Priority 3: bare user ID on a "Closed by" line
+            if not closer_id:
+                m = re.search(
+                    r"closed\s+by[:\s]+(\d{17,20})",
+                    desc,
+                    re.IGNORECASE,
+                )
+                if m:
+                    closer_id = int(m.group(1))
+
+            # Priority 4: name lookup via guild members
+            if not closer_id:
+                m = re.search(
+                    r"closed\s+by[:\s]+(.+?)(?:\n|$)",
+                    desc,
+                    re.IGNORECASE,
+                )
+                if m and message.guild:
+                    name = m.group(1).strip()
+                    found = discord.utils.find(
+                        lambda mem: mem.display_name == name or str(mem) == name,
+                        message.guild.members,
+                    )
+                    if found:
+                        closer_id = found.id
+
+            # Priority 5: footer text "Closed by …" or "User ID: …"
+            if not closer_id:
+                footer_text = embed.footer.text or ""
+                m = re.search(r"<@!?(\d{17,20})>", footer_text)
+                if not m:
+                    m = re.search(r"user\s*id[:\s]+(\d{17,20})", footer_text, re.IGNORECASE)
+                if m:
+                    closer_id = int(m.group(1))
+
+            if closer_id:
+                self._record_action(closer_id, "ticket_close", link=message.jump_url)
+            break  # only process the first matching embed
 
     async def _post_mod_action(
         self,
