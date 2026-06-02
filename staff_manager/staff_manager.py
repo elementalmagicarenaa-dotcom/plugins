@@ -857,90 +857,154 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
 
     async def _handle_ticket_close(self, message: discord.Message) -> None:
         """
-        Parse a Modmail thread-close log embed and record a ticket_close stat
-        for whoever closed the ticket.
+        Parse a Modmail thread-close log embed and record a ticket_close stat.
 
-        Modmail's close embed typically looks like one of:
-          • title "Thread Closed" with a "Closed by" field or footer
-          • description containing "Closed by <@id>" or "closed by Username"
-          • author name set to the closer's display name
+        Strategy (most → least reliable):
+          1. "Closed by" / "closer" / "moderator" field containing a mention or ID
+          2. "Closed by …" anywhere in description
+          3. Footer text containing "Closed by" + name / ID
+          4. Any mention in the embed that belongs to a known staff member
+          5. Any bare 17–20 digit ID in the whole embed that is a staff member
 
-        We try each location in priority order and stop at the first hit.
+        We accept any embed that contains "close" or "ticket" or "thread" anywhere
+        in the full embed text so we're not tripped up by title variations.
         """
         for embed in message.embeds:
-            title_str = (embed.title or "").lower()
-            desc      = embed.description or ""
-            desc_lower = desc.lower()
+            # Build one big searchable string from every part of the embed
+            parts: List[str] = [
+                embed.title or "",
+                embed.description or "",
+                getattr(embed.author, "name", "") or "",
+                embed.footer.text or "",
+            ]
+            for f in embed.fields:
+                parts.append(f.name or "")
+                parts.append(f.value or "")
+            full_text = "\n".join(parts)
+            full_lower = full_text.lower()
 
-            # Only process embeds that look like a thread/ticket close
-            is_close = (
-                "thread closed" in title_str
-                or "ticket closed" in title_str
-                or "closed" in title_str
-                or "thread closed" in desc_lower
-            )
-            if not is_close:
+            # Gate: must look like a close/ticket/thread embed
+            if not any(kw in full_lower for kw in ("close", "ticket", "thread")):
                 continue
 
             closer_id: Optional[int] = None
+            guild = message.guild
+            staff_role_ids = set(self._staff_role_map().values())
 
-            # Priority 1: explicit "Closed by" field with a mention
+            def _is_staff(uid: int) -> bool:
+                if not guild:
+                    return False
+                member = guild.get_member(uid)
+                if not member:
+                    return False
+                return bool({r.id for r in member.roles} & staff_role_ids)
+
+            # ── Priority 1: "Closed by / Closer / Moderator" FIELD ───────
             for field in embed.fields:
                 fname = (field.name or "").lower()
-                if "closed" in fname or "closer" in fname or "by" in fname:
-                    m = re.search(r"<@!?(\d{17,20})>", field.value or "")
+                if any(kw in fname for kw in ("closed", "closer", "moderator", "mod", "by")):
+                    fval = field.value or ""
+                    # mention
+                    m = re.search(r"<@!?(\d{17,20})>", fval)
                     if m:
                         closer_id = int(m.group(1))
                         break
+                    # bare ID
+                    m = re.search(r"\b(\d{17,20})\b", fval)
+                    if m:
+                        closer_id = int(m.group(1))
+                        break
+                    # name lookup
+                    name = re.sub(r"[<@!>]", "", fval).strip()
+                    if name and guild:
+                        found = discord.utils.find(
+                            lambda mem, n=name: mem.display_name == n or str(mem) == n,
+                            guild.members,
+                        )
+                        if found:
+                            closer_id = found.id
+                            break
 
-            # Priority 2: mention in description on a "Closed by …" line
+            # ── Priority 2: "Closed by …" anywhere in description ────────
             if not closer_id:
+                desc = embed.description or ""
+                # mention
                 m = re.search(
                     r"closed\s+by[:\s]+<@!?(\d{17,20})>",
-                    desc,
-                    re.IGNORECASE,
+                    desc, re.IGNORECASE,
                 )
                 if m:
                     closer_id = int(m.group(1))
-
-            # Priority 3: bare user ID on a "Closed by" line
-            if not closer_id:
-                m = re.search(
-                    r"closed\s+by[:\s]+(\d{17,20})",
-                    desc,
-                    re.IGNORECASE,
-                )
-                if m:
-                    closer_id = int(m.group(1))
-
-            # Priority 4: name lookup via guild members
-            if not closer_id:
-                m = re.search(
-                    r"closed\s+by[:\s]+(.+?)(?:\n|$)",
-                    desc,
-                    re.IGNORECASE,
-                )
-                if m and message.guild:
-                    name = m.group(1).strip()
-                    found = discord.utils.find(
-                        lambda mem: mem.display_name == name or str(mem) == name,
-                        message.guild.members,
+                # bare ID
+                if not closer_id:
+                    m = re.search(
+                        r"closed\s+by[:\s]+(\d{17,20})",
+                        desc, re.IGNORECASE,
                     )
-                    if found:
-                        closer_id = found.id
+                    if m:
+                        closer_id = int(m.group(1))
+                # name
+                if not closer_id:
+                    m = re.search(
+                        r"closed\s+by[:\s]+(.+?)(?:\n|$)",
+                        desc, re.IGNORECASE,
+                    )
+                    if m and guild:
+                        name = m.group(1).strip()
+                        found = discord.utils.find(
+                            lambda mem, n=name: mem.display_name == n or str(mem) == n,
+                            guild.members,
+                        )
+                        if found:
+                            closer_id = found.id
 
-            # Priority 5: footer text "Closed by …" or "User ID: …"
+            # ── Priority 3: footer "Closed by …" / "moderator ID: …" ─────
             if not closer_id:
-                footer_text = embed.footer.text or ""
-                m = re.search(r"<@!?(\d{17,20})>", footer_text)
-                if not m:
-                    m = re.search(r"user\s*id[:\s]+(\d{17,20})", footer_text, re.IGNORECASE)
-                if m:
-                    closer_id = int(m.group(1))
+                footer = embed.footer.text or ""
+                for pat in [
+                    r"closed\s+by[:\s]+<@!?(\d{17,20})>",
+                    r"closed\s+by[:\s]+(\d{17,20})",
+                    r"moderator\s*id[:\s]+(\d{17,20})",
+                    r"mod\s*id[:\s]+(\d{17,20})",
+                ]:
+                    m = re.search(pat, footer, re.IGNORECASE)
+                    if m:
+                        closer_id = int(m.group(1))
+                        break
+                if not closer_id:
+                    # name fallback in footer
+                    m = re.search(
+                        r"closed\s+by[:\s]+(.+?)(?:\s*\||\s*·|$)",
+                        footer, re.IGNORECASE,
+                    )
+                    if m and guild:
+                        name = m.group(1).strip()
+                        found = discord.utils.find(
+                            lambda mem, n=name: mem.display_name == n or str(mem) == n,
+                            guild.members,
+                        )
+                        if found:
+                            closer_id = found.id
+
+            # ── Priority 4: any mention in the embed → pick the staff one ─
+            if not closer_id and staff_role_ids:
+                for raw_id in re.findall(r"<@!?(\d{17,20})>", full_text):
+                    uid = int(raw_id)
+                    if _is_staff(uid):
+                        closer_id = uid
+                        break
+
+            # ── Priority 5: any bare ID in the embed → pick the staff one ─
+            if not closer_id and staff_role_ids:
+                for raw_id in re.findall(r"\b(\d{17,20})\b", full_text):
+                    uid = int(raw_id)
+                    if _is_staff(uid):
+                        closer_id = uid
+                        break
 
             if closer_id:
                 self._record_action(closer_id, "ticket_close", link=message.jump_url)
-            break  # only process the first matching embed
+            break  # only process the first matching embed per message
 
     async def _post_mod_action(
         self,
