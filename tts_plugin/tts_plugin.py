@@ -90,7 +90,7 @@ class TTSPlugin(commands.Cog):
                 if vc.channel.id != target.id:
                     await vc.move_to(target)
             else:
-                vc = await target.connect()
+                vc = await target.connect(reconnect=False)
                 self._voice_clients[guild_id] = vc
         except Exception as e:
             logger.error(f"VC connect/move error: {e}", exc_info=True)
@@ -219,7 +219,7 @@ class TTSPlugin(commands.Cog):
             if vc and vc.is_connected():
                 await vc.move_to(channel)
             else:
-                vc = await channel.connect()
+                vc = await channel.connect(reconnect=False)
                 self._voice_clients[guild_id] = vc
         except Exception as e:
             return await ctx.send(embed=discord.Embed(
