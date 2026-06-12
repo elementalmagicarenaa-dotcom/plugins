@@ -336,6 +336,32 @@ class TTSPlugin(commands.Cog):
         embed.set_footer(text="Change with: .talkvoice <name>")
         await ctx.send(embed=embed)
 
+    # ------------------------------------------------------------------ voice state tracking
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """
+        Clean up internal state when the bot is disconnected from a VC by Discord
+        or an external action (kick, server move, etc.), so we don't get stuck in
+        a join/leave loop trying to reconnect to a stale voice client.
+        """
+        if member.id != self.bot.user.id:
+            return
+
+        # Bot left a channel (either moved or fully disconnected)
+        if before.channel is not None and after.channel is None:
+            guild_id = before.channel.guild.id
+            # Only clean up if we didn't initiate the disconnect ourselves
+            # (i.e. the voice client is still in our registry but no longer connected)
+            vc = self._voice_clients.get(guild_id)
+            if vc and not vc.is_connected():
+                await self._cleanup(guild_id)
+
     # ------------------------------------------------------------------ cleanup on unload
 
     def cog_unload(self) -> None:
