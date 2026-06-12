@@ -87,6 +87,22 @@ class TTSPlugin(commands.Cog):
     async def _connect(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
         """Connect to a voice channel after clearing any existing session."""
         guild = channel.guild
+
+        # Check permissions before attempting — missing Connect/Speak is a common
+        # cause of silent 4017 disconnects
+        me = guild.me
+        perms = channel.permissions_for(me)
+        missing = []
+        if not perms.connect:
+            missing.append("Connect")
+        if not perms.speak:
+            missing.append("Speak")
+        if missing:
+            raise RuntimeError(
+                f"Bot is missing permissions in **{channel.name}**: {', '.join(missing)}. "
+                "Grant these in your server's channel settings and try again."
+            )
+
         await self._force_disconnect(guild)
         await asyncio.sleep(1)
         return await channel.connect(reconnect=False)
@@ -179,6 +195,71 @@ class TTSPlugin(commands.Cog):
             self._workers[guild_id] = asyncio.create_task(self._worker(guild_id))
 
     # ------------------------------------------------------------------ commands
+
+    @commands.command(name="talkcheck")
+    @checks.has_permissions(REQUIRED_LEVEL)
+    async def talkcheck(self, ctx: commands.Context) -> None:
+        """Run a full diagnostics check for TTS requirements. Usage: .talkcheck"""
+        lines = []
+
+        # 1. PyNaCl
+        try:
+            import nacl.secret  # noqa: F401
+            import nacl
+            lines.append(f"✅ PyNaCl {nacl.__version__} installed")
+        except ImportError:
+            lines.append("❌ PyNaCl NOT installed — run `pip install PyNaCl` on the bot server")
+
+        # 2. edge-tts
+        try:
+            import edge_tts  # noqa: F401
+            lines.append("✅ edge-tts installed")
+        except ImportError:
+            lines.append("❌ edge-tts NOT installed — run `pip install edge-tts`")
+
+        # 3. ffmpeg
+        import shutil
+        if shutil.which("ffmpeg"):
+            lines.append("✅ ffmpeg found on PATH")
+        else:
+            lines.append("❌ ffmpeg NOT found — install it (`apt install ffmpeg` on Linux)")
+
+        # 4. discord.py version
+        lines.append(f"ℹ️ discord.py {discord.__version__}")
+
+        # 5. Bot voice permissions in this guild (check every VC)
+        no_perm_channels = []
+        for vc_channel in ctx.guild.voice_channels:
+            perms = vc_channel.permissions_for(ctx.guild.me)
+            if not perms.connect or not perms.speak:
+                no_perm_channels.append(vc_channel.name)
+        if no_perm_channels:
+            lines.append(f"❌ Missing Connect/Speak in: {', '.join(no_perm_channels)}")
+        else:
+            lines.append("✅ Bot has Connect + Speak in all voice channels")
+
+        # 6. Quick edge-tts network test (generate 1 word)
+        try:
+            import edge_tts as _et
+            import tempfile, os as _os
+            _tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            _tmp.close()
+            await _et.Communicate("test", DEFAULT_VOICE).save(_tmp.name)
+            size = _os.path.getsize(_tmp.name)
+            _os.unlink(_tmp.name)
+            if size > 0:
+                lines.append("✅ edge-tts network reachable (generated audio successfully)")
+            else:
+                lines.append("⚠️ edge-tts returned empty audio — check network/firewall")
+        except Exception as e:
+            lines.append(f"❌ edge-tts network test failed: `{e}`")
+
+        embed = discord.Embed(
+            title="🔍 TTS Diagnostics",
+            description="\n".join(lines),
+            color=discord.Color.green() if all(l.startswith("✅") for l in lines) else discord.Color.orange(),
+        )
+        await ctx.send(embed=embed)
 
     @commands.command(name="talkjoin")
     @checks.has_permissions(REQUIRED_LEVEL)
