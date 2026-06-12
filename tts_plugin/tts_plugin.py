@@ -90,6 +90,11 @@ class TTSPlugin(commands.Cog):
                 if vc.channel.id != target.id:
                     await vc.move_to(target)
             else:
+                # Kill any ghost session discord.py is still tracking internally
+                # (causes 4017 if we connect while a stale session exists)
+                existing = ctx.guild.voice_client
+                if existing:
+                    await existing.disconnect(force=True)
                 vc = await target.connect(reconnect=False)
                 self._voice_clients[guild_id] = vc
         except Exception as e:
@@ -219,6 +224,10 @@ class TTSPlugin(commands.Cog):
             if vc and vc.is_connected():
                 await vc.move_to(channel)
             else:
+                # Kill any ghost session discord.py is still tracking internally
+                existing = ctx.guild.voice_client
+                if existing:
+                    await existing.disconnect(force=True)
                 vc = await channel.connect(reconnect=False)
                 self._voice_clients[guild_id] = vc
         except Exception as e:
