@@ -3,6 +3,7 @@ TTS Voice Plugin for ModMail
 =============================
 Commands:
   .talk <text>          — Join your VC and say the text (queued, never cuts off)
+  .talkjoin <channel>   — Join a specific VC by name or ID
   .talkleave            — Leave the voice channel and clear the queue
   .talkvoice <voice>    — Change TTS voice (see VOICES list below)
   .talkvoices           — List available voices
@@ -31,28 +32,21 @@ logger = logging.getLogger("Modmail")
 # ============================================================
 # CONFIG
 # ============================================================
-# Default voice — Microsoft neural voices are very natural/human-sounding.
-# Run `.talkvoices` in Discord to see all available options.
 DEFAULT_VOICE = "en-US-GuyNeural"
-
-# How long (seconds) the bot stays idle in VC before auto-disconnecting.
-IDLE_TIMEOUT = 300  # 5 minutes
-
-# Minimum permission level required to use .talk commands.
+IDLE_TIMEOUT = 300  # seconds before auto-disconnect when idle
 REQUIRED_LEVEL = PermissionLevel.ADMINISTRATOR
 # ============================================================
 
-# Curated list of natural-sounding voices shown by .talkvoices
 VOICES = {
-    "guy":     "en-US-GuyNeural",       # US male, conversational
-    "aria":    "en-US-AriaNeural",      # US female, conversational
-    "jenny":   "en-US-JennyNeural",     # US female, friendly
-    "sonia":   "en-GB-SoniaNeural",     # British female
-    "ryan":    "en-GB-RyanNeural",      # British male
-    "natasha": "en-AU-NatashaNeural",   # Australian female
-    "william": "en-AU-WilliamNeural",   # Australian male
-    "clara":   "en-CA-ClaraNeural",     # Canadian female
-    "liam":    "en-CA-LiamNeural",      # Canadian male
+    "guy":     "en-US-GuyNeural",
+    "aria":    "en-US-AriaNeural",
+    "jenny":   "en-US-JennyNeural",
+    "sonia":   "en-GB-SoniaNeural",
+    "ryan":    "en-GB-RyanNeural",
+    "natasha": "en-AU-NatashaNeural",
+    "william": "en-AU-WilliamNeural",
+    "clara":   "en-CA-ClaraNeural",
+    "liam":    "en-CA-LiamNeural",
 }
 
 
@@ -61,64 +55,47 @@ class TTSPlugin(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # Per-guild state
-        self._voice_clients: dict[int, discord.VoiceClient] = {}
         self._queues: dict[int, asyncio.Queue] = {}
         self._workers: dict[int, asyncio.Task] = {}
-        self._voices: dict[int, str] = {}  # guild_id -> voice name
+        self._voices: dict[int, str] = {}
 
     # ------------------------------------------------------------------ helpers
 
     def _voice_for(self, guild_id: int) -> str:
         return self._voices.get(guild_id, DEFAULT_VOICE)
 
-    async def _join_or_move(self, ctx: commands.Context) -> discord.VoiceClient | None:
-        """Return a connected VoiceClient for the author's current channel."""
-        if not ctx.author.voice or not ctx.author.voice.channel:
-            await ctx.send(embed=discord.Embed(
-                description="❌ You need to be in a voice channel first.",
-                color=discord.Color.red(),
-            ))
-            return None
+    def _vc(self, guild: discord.Guild) -> discord.VoiceClient | None:
+        """Return the bot's current VoiceClient for this guild, or None."""
+        vc = guild.voice_client
+        if vc and isinstance(vc, discord.VoiceClient) and vc.is_connected():
+            return vc
+        return None
 
-        target = ctx.author.voice.channel
-        guild_id = ctx.guild.id
-        vc = self._voice_clients.get(guild_id)
+    async def _connect(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
+        """
+        Connect to a voice channel cleanly.
+        Always disconnects any existing session first to avoid 4017 conflicts.
+        """
+        guild = channel.guild
+        existing = guild.voice_client
+        if existing:
+            try:
+                await existing.disconnect(force=True)
+            except Exception:
+                pass
+            # Brief pause so Discord registers the disconnect before we reconnect
+            await asyncio.sleep(0.5)
 
-        try:
-            if vc and vc.is_connected():
-                if vc.channel.id != target.id:
-                    await vc.move_to(target)
-            else:
-                # Kill any ghost session discord.py is still tracking internally
-                # (causes 4017 if we connect while a stale session exists)
-                existing = ctx.guild.voice_client
-                if existing:
-                    await existing.disconnect(force=True)
-                vc = await target.connect(reconnect=False)
-                self._voice_clients[guild_id] = vc
-        except Exception as e:
-            logger.error(f"VC connect/move error: {e}", exc_info=True)
-            await ctx.send(embed=discord.Embed(
-                description=f"❌ Could not connect to voice: `{e}`",
-                color=discord.Color.red(),
-            ))
-            return None
-
-        return vc
+        return await channel.connect(reconnect=False, self_deaf=True)
 
     async def _generate_audio(self, text: str, voice: str) -> str:
-        """
-        Generate TTS audio with edge-tts and save to a temp MP3 file.
-        Returns the file path (caller is responsible for deleting it).
-        """
+        """Generate TTS audio, save to a temp MP3, return the path."""
         try:
-            import edge_tts  # imported lazily so the plugin loads even if not installed
+            import edge_tts
         except ImportError:
             raise RuntimeError(
                 "edge-tts is not installed. Run `pip install edge-tts` on the bot server."
             )
-
         communicate = edge_tts.Communicate(text, voice)
         tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
         tmp.close()
@@ -126,14 +103,13 @@ class TTSPlugin(commands.Cog):
         return tmp.name
 
     async def _worker(self, guild_id: int) -> None:
-        """
-        Per-guild queue worker. Plays TTS items one at a time.
-        Auto-disconnects after IDLE_TIMEOUT seconds of inactivity.
-        """
+        """Per-guild queue worker — plays items one at a time, auto-disconnects on idle."""
         queue = self._queues[guild_id]
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
 
         while True:
-            # Wait for the next item, auto-disconnect on timeout
             try:
                 text, voice = await asyncio.wait_for(queue.get(), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
@@ -143,31 +119,28 @@ class TTSPlugin(commands.Cog):
             except asyncio.CancelledError:
                 return
 
-            vc = self._voice_clients.get(guild_id)
-            if not vc or not vc.is_connected():
+            vc = self._vc(guild)
+            if not vc:
                 queue.task_done()
-                # VC is gone — stop the worker; cleanup is handled by on_voice_state_update
                 return
 
             tmp_path = None
             try:
                 tmp_path = await self._generate_audio(text, voice)
-
                 finished = asyncio.Event()
 
                 def _after(err: Exception | None) -> None:
                     if err:
-                        logger.error(f"FFmpeg playback error in guild {guild_id}: {err}")
+                        logger.error(f"FFmpeg error in guild {guild_id}: {err}")
                     finished.set()
 
                 vc.play(discord.FFmpegPCMAudio(tmp_path), after=_after)
                 await finished.wait()
 
             except RuntimeError as e:
-                # edge-tts not installed — log and give up on this item
                 logger.error(str(e))
             except Exception as e:
-                logger.error(f"TTS playback error in guild {guild_id}: {e}", exc_info=True)
+                logger.error(f"TTS error in guild {guild_id}: {e}", exc_info=True)
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     try:
@@ -177,28 +150,27 @@ class TTSPlugin(commands.Cog):
                 queue.task_done()
 
     async def _cleanup(self, guild_id: int) -> None:
-        """Disconnect from VC and cancel the worker for a guild."""
-        vc = self._voice_clients.pop(guild_id, None)
-        if vc:
-            try:
-                if vc.is_playing():
-                    vc.stop()
-                # force=True stops discord.py's internal reconnection loop
-                await vc.disconnect(force=True)
-            except Exception:
-                pass
-
+        """Disconnect from VC and stop the worker."""
         task = self._workers.pop(guild_id, None)
         if task and not task.done():
             task.cancel()
 
         self._queues.pop(guild_id, None)
 
+        guild = self.bot.get_guild(guild_id)
+        if guild:
+            vc = guild.voice_client
+            if vc:
+                try:
+                    if vc.is_playing():
+                        vc.stop()
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+
     def _ensure_worker(self, guild_id: int) -> None:
-        """Start the queue worker for a guild if it isn't running."""
         if guild_id not in self._queues:
             self._queues[guild_id] = asyncio.Queue()
-
         existing = self._workers.get(guild_id)
         if not existing or existing.done():
             self._workers[guild_id] = asyncio.create_task(self._worker(guild_id))
@@ -210,33 +182,20 @@ class TTSPlugin(commands.Cog):
     async def talkjoin(self, ctx: commands.Context, *, channel: discord.VoiceChannel) -> None:
         """
         Join a specific voice channel by name, mention, or ID.
-        After joining, use .talk as normal.
 
         Usage:
           .talkjoin General
           .talkjoin 1234567890123456
-          .talkjoin #General
         """
-        guild_id = ctx.guild.id
-        vc = self._voice_clients.get(guild_id)
-
         try:
-            if vc and vc.is_connected():
-                await vc.move_to(channel)
-            else:
-                # Kill any ghost session discord.py is still tracking internally
-                existing = ctx.guild.voice_client
-                if existing:
-                    await existing.disconnect(force=True)
-                vc = await channel.connect(reconnect=False)
-                self._voice_clients[guild_id] = vc
+            await self._connect(channel)
         except Exception as e:
             return await ctx.send(embed=discord.Embed(
                 description=f"❌ Could not join **{channel.name}**: `{e}`",
                 color=discord.Color.red(),
             ))
 
-        self._ensure_worker(guild_id)
+        self._ensure_worker(ctx.guild.id)
         await ctx.send(embed=discord.Embed(
             description=f"✅ Joined **{channel.name}**. Use `.talk <text>` to speak.",
             color=discord.Color.green(),
@@ -246,27 +205,31 @@ class TTSPlugin(commands.Cog):
     @checks.has_permissions(REQUIRED_LEVEL)
     async def talk(self, ctx: commands.Context, *, text: str) -> None:
         """
-        Speak the given text in the current voice channel.
-        If the bot isn't in a VC yet, it joins yours automatically.
-        Text is queued — multiple .talk commands play in order.
+        Speak text in the current voice channel.
+        Joins your VC automatically if not already connected.
+        Messages are queued and play in order.
 
-        Usage: .talk Hello, how is everyone doing today?
+        Usage: .talk Hello, how is everyone?
         """
-        # If already in a VC in this guild, use it directly (don't force-follow the user)
         guild_id = ctx.guild.id
-        vc = self._voice_clients.get(guild_id)
-        if not vc or not vc.is_connected():
-            # Not in any VC — join the author's channel
-            vc = await self._join_or_move(ctx)
-            if not vc:
-                return
+
+        if not self._vc(ctx.guild):
+            if not ctx.author.voice or not ctx.author.voice.channel:
+                return await ctx.send(embed=discord.Embed(
+                    description="❌ You need to be in a voice channel first.",
+                    color=discord.Color.red(),
+                ))
+            try:
+                await self._connect(ctx.author.voice.channel)
+            except Exception as e:
+                return await ctx.send(embed=discord.Embed(
+                    description=f"❌ Could not connect to voice: `{e}`",
+                    color=discord.Color.red(),
+                ))
 
         self._ensure_worker(guild_id)
+        await self._queues[guild_id].put((text, self._voice_for(guild_id)))
 
-        voice = self._voice_for(guild_id)
-        await self._queues[guild_id].put((text, voice))
-
-        # React to confirm the item was queued
         try:
             await ctx.message.add_reaction("🔊")
         except discord.HTTPException:
@@ -275,20 +238,14 @@ class TTSPlugin(commands.Cog):
     @commands.command(name="talkleave", aliases=["talkstop", "talkdisconnect"])
     @checks.has_permissions(REQUIRED_LEVEL)
     async def talkleave(self, ctx: commands.Context) -> None:
-        """
-        Stop speaking and leave the voice channel.
-
-        Usage: .talkleave
-        """
-        guild_id = ctx.guild.id
-
-        if guild_id not in self._voice_clients:
+        """Leave the voice channel and clear the queue. Usage: .talkleave"""
+        if not self._vc(ctx.guild) and ctx.guild.id not in self._workers:
             return await ctx.send(embed=discord.Embed(
                 description="❌ I'm not in a voice channel.",
                 color=discord.Color.red(),
             ))
 
-        await self._cleanup(guild_id)
+        await self._cleanup(ctx.guild.id)
 
         try:
             await ctx.message.add_reaction("👋")
@@ -299,14 +256,11 @@ class TTSPlugin(commands.Cog):
     @checks.has_permissions(REQUIRED_LEVEL)
     async def talkvoice(self, ctx: commands.Context, *, name: str) -> None:
         """
-        Change the TTS voice for this server.
-        Run .talkvoices to see the available options.
+        Change the TTS voice. Run .talkvoices to see options.
 
         Usage: .talkvoice aria
         """
         name = name.strip().lower()
-
-        # Accept either a shorthand (e.g. "aria") or a full name (e.g. "en-US-AriaNeural")
         if name in VOICES:
             full_name = VOICES[name]
         elif name in VOICES.values():
@@ -327,17 +281,12 @@ class TTSPlugin(commands.Cog):
     @commands.command(name="talkvoices")
     @checks.has_permissions(REQUIRED_LEVEL)
     async def talkvoices(self, ctx: commands.Context) -> None:
-        """
-        List all available TTS voices.
-
-        Usage: .talkvoices
-        """
+        """List all available TTS voices. Usage: .talkvoices"""
         current = self._voice_for(ctx.guild.id)
-        lines = []
-        for short, full in VOICES.items():
-            marker = " ◀ current" if full == current else ""
-            lines.append(f"`{short:<10}` — {full}{marker}")
-
+        lines = [
+            f"`{short:<10}` — {full}{' ◀ current' if full == current else ''}"
+            for short, full in VOICES.items()
+        ]
         embed = discord.Embed(
             title="🎙️ Available TTS Voices",
             description="\n".join(lines),
@@ -346,37 +295,10 @@ class TTSPlugin(commands.Cog):
         embed.set_footer(text="Change with: .talkvoice <name>")
         await ctx.send(embed=embed)
 
-    # ------------------------------------------------------------------ voice state tracking
-
-    @commands.Cog.listener()
-    async def on_voice_state_update(
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
-    ) -> None:
-        """
-        Clean up internal state when the bot is disconnected from a VC by Discord
-        or an external action (kick, server move, etc.), so we don't get stuck in
-        a join/leave loop trying to reconnect to a stale voice client.
-        """
-        if member.id != self.bot.user.id:
-            return
-
-        # Bot left a channel (either moved or fully disconnected)
-        if before.channel is not None and after.channel is None:
-            guild_id = before.channel.guild.id
-            # Always clean up if this guild is in our registry.
-            # _cleanup pops the entry first, so if WE called disconnect() it's
-            # already gone and this is a no-op — no recursive loop.
-            if guild_id in self._voice_clients:
-                await self._cleanup(guild_id)
-
     # ------------------------------------------------------------------ cleanup on unload
 
     def cog_unload(self) -> None:
-        """Disconnect from all VCs and cancel all workers when the cog is unloaded."""
-        for guild_id in list(self._voice_clients.keys()):
+        for guild_id in list(self._workers.keys()):
             asyncio.create_task(self._cleanup(guild_id))
 
 
