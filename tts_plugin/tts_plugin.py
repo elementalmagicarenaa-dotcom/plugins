@@ -72,57 +72,24 @@ class TTSPlugin(commands.Cog):
         return None
 
     async def _force_disconnect(self, guild: discord.Guild) -> None:
-        """Fully clear all voice state for this guild — local and gateway-side."""
-        # Kill local VoiceClient
+        """Fully clear all voice state — local client and Discord gateway."""
         existing = guild.voice_client
         if existing:
             try:
                 await existing.disconnect(force=True)
             except Exception:
                 pass
-
-        # Tell Discord's gateway we're leaving voice entirely.
-        # This clears the server-side session that causes 4017.
         try:
             await guild.change_voice_state(channel=None)
         except Exception:
             pass
 
     async def _connect(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
-        """
-        Connect to a voice channel, retrying once if the session is rejected.
-
-        Discord error 4017 means the voice WebSocket was closed after connecting —
-        usually because a previous session is still registered server-side.
-        We clear all state, wait, connect, then verify the connection held before
-        returning. If it dropped (4017), we wait longer and try once more.
-        """
+        """Connect to a voice channel after clearing any existing session."""
         guild = channel.guild
-
         await self._force_disconnect(guild)
-        await asyncio.sleep(2)
-
-        vc = await channel.connect(reconnect=False)
-
-        # Give the voice WebSocket a moment to fully establish.
-        # 4017 typically arrives within ~1-2 seconds if the session is bad.
-        await asyncio.sleep(2)
-
-        if not vc.is_connected():
-            # First attempt was rejected — clear everything and try once more
-            logger.warning(f"Voice connection dropped immediately in guild {guild.id}, retrying…")
-            await self._force_disconnect(guild)
-            await asyncio.sleep(5)
-            vc = await channel.connect(reconnect=False)
-            await asyncio.sleep(2)
-            if not vc.is_connected():
-                raise RuntimeError(
-                    "Voice connection dropped twice (Discord error 4017). "
-                    "Wait a few minutes and try again — Discord may be rate-limiting voice connections "
-                    "due to rapid joins earlier."
-                )
-
-        return vc
+        await asyncio.sleep(1)
+        return await channel.connect(reconnect=False)
 
     async def _generate_audio(self, text: str, voice: str) -> str:
         """Generate TTS audio, save to a temp MP3, return the path."""
