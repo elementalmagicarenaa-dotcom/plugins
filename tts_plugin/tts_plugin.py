@@ -141,7 +141,8 @@ class TTSPlugin(commands.Cog):
             vc = self._voice_clients.get(guild_id)
             if not vc or not vc.is_connected():
                 queue.task_done()
-                continue
+                # VC is gone — stop the worker; cleanup is handled by on_voice_state_update
+                return
 
             tmp_path = None
             try:
@@ -356,10 +357,10 @@ class TTSPlugin(commands.Cog):
         # Bot left a channel (either moved or fully disconnected)
         if before.channel is not None and after.channel is None:
             guild_id = before.channel.guild.id
-            # Only clean up if we didn't initiate the disconnect ourselves
-            # (i.e. the voice client is still in our registry but no longer connected)
-            vc = self._voice_clients.get(guild_id)
-            if vc and not vc.is_connected():
+            # Always clean up if this guild is in our registry.
+            # _cleanup pops the entry first, so if WE called disconnect() it's
+            # already gone and this is a no-op — no recursive loop.
+            if guild_id in self._voice_clients:
                 await self._cleanup(guild_id)
 
     # ------------------------------------------------------------------ cleanup on unload
