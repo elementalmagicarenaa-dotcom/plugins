@@ -177,8 +177,8 @@ class TTSPlugin(commands.Cog):
             try:
                 if vc.is_playing():
                     vc.stop()
-                if vc.is_connected():
-                    await vc.disconnect()
+                # force=True stops discord.py's internal reconnection loop
+                await vc.disconnect(force=True)
             except Exception:
                 pass
 
