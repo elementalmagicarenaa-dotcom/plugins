@@ -73,20 +73,37 @@ class TTSPlugin(commands.Cog):
 
     async def _connect(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
         """
-        Connect to a voice channel cleanly.
-        Always disconnects any existing session first to avoid 4017 conflicts.
+        Connect to a voice channel cleanly, preventing Discord error 4017.
+
+        4017 happens when Discord's servers still have an active voice session
+        for this bot even after the local VoiceClient is gone (e.g. after a
+        restart or a crash).  We fix it by:
+          1. Disconnecting the local VoiceClient if one exists.
+          2. Sending a gateway voice-state-update with channel=None so Discord
+             clears the server-side session.
+          3. Waiting long enough for Discord to process both before reconnecting.
         """
         guild = channel.guild
+
+        # Step 1 — kill the local voice client
         existing = guild.voice_client
         if existing:
             try:
                 await existing.disconnect(force=True)
             except Exception:
                 pass
-            # Brief pause so Discord registers the disconnect before we reconnect
-            await asyncio.sleep(0.5)
 
-        return await channel.connect(reconnect=False, self_deaf=True)
+        # Step 2 — tell Discord's gateway we are leaving all voice channels.
+        # This clears the server-side session that causes 4017.
+        try:
+            await guild.change_voice_state(channel=None)
+        except Exception:
+            pass
+
+        # Step 3 — give Discord time to process both disconnects
+        await asyncio.sleep(1.5)
+
+        return await channel.connect(reconnect=False)
 
     async def _generate_audio(self, text: str, voice: str) -> str:
         """Generate TTS audio, save to a temp MP3, return the path."""
