@@ -132,24 +132,45 @@ DYNO_TITLE_MAP: Dict[str, str] = {
     "noted":             "note",
     "note":              "note",
     # --- reverse actions (decrement stats) ---
-    "member unbanned":   "unban",
-    "user unbanned":     "unban",
-    "unbanned":          "unban",
-    "unban":             "unban",
-    "member unmuted":    "unmute",
-    "user unmuted":      "unmute",
-    "unmuted":           "unmute",
-    "unmute":            "unmute",
-    "warning deleted":   "delwarn",
-    "warn deleted":      "delwarn",
-    "case deleted":      "delwarn",
+    "member unbanned":      "unban",
+    "user unbanned":        "unban",
+    "unbanned":             "unban",
+    "unban":                "unban",
+    "member unmuted":       "unmute",
+    "user unmuted":         "unmute",
+    "unmuted":              "unmute",
+    "unmute":               "unmute",
+    "mute removed":         "unmute",
+    "mute expired":         "unmute",
+    "tempmute expired":     "unmute",
+    "temp mute expired":    "unmute",
+    "ban removed":          "unban",
+    "ban expired":          "unban",
+    "tempban expired":      "unban",
+    "temp ban expired":     "unban",
+    "warning deleted":      "delcase",
+    "warning removed":      "delcase",
+    "warn deleted":         "delcase",
+    "warn removed":         "delcase",
+    "note deleted":         "delnote",
+    "note removed":         "delnote",
+    "case deleted":         "delcase",
+    "case removed":         "delcase",
 }
 
-# Maps a reverse action to the tracked action it should decrement
+# Maps a reverse action to the tracked action it should decrement.
+# "delcase" is a placeholder — _parse_dyno_embed replaces it with the
+# specific action type detected from the embed fields at parse time.
 REVERSE_ACTION_MAP: Dict[str, str] = {
-    "unban":   "ban",
-    "unmute":  "mute",
-    "delwarn": "warn",
+    "unban":      "ban",
+    "unmute":     "mute",
+    "delwarn":    "warn",   # kept for safety
+    "delcase":    "warn",   # default; overridden per-embed in _parse_dyno_embed
+    "delmute":    "mute",
+    "delkick":    "kick",
+    "delban":     "ban",
+    "delsoftban": "softban",
+    "delnote":    "note",
 }
 
 # Embed text patterns that indicate a *lookup/list* command, not a new action.
@@ -289,6 +310,43 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
             break
     if action is None:
         return None
+
+    # --- Refine generic "delcase" to the specific action that was deleted ---
+    # Dyno's "case deleted" embed usually has an "Action" or "Type" field
+    # telling us what kind of case it was (e.g. "Ban", "Mute", "Warn").
+    # We map that to the correct del* key so the right stat is decremented.
+    if action == "delcase":
+        _CASE_TYPE_MAP = {
+            "softban": "delsoftban",
+            "ban":     "delban",
+            "mute":    "delmute",
+            "kick":    "delkick",
+            "note":    "delnote",
+            "warn":    "delwarn",
+            "warning": "delwarn",
+        }
+        # Check embed fields first (most reliable)
+        original_action: Optional[str] = None
+        for f in embed.fields:
+            fname = (f.name or "").lower()
+            if any(kw in fname for kw in ("action", "type", "punishment", "case type")):
+                fval = (f.value or "").lower()
+                # longest keys first so "softban" beats "ban"
+                for key in sorted(_CASE_TYPE_MAP, key=len, reverse=True):
+                    if key in fval:
+                        original_action = _CASE_TYPE_MAP[key]
+                        break
+                if original_action:
+                    break
+        # Fallback: scan the whole embed text for the first action type mentioned
+        if not original_action:
+            combined = f"{title_str} {author_str} {desc_lower}"
+            for key in sorted(_CASE_TYPE_MAP, key=len, reverse=True):
+                if re.search(rf"\b{re.escape(key)}\b", combined):
+                    original_action = _CASE_TYPE_MAP[key]
+                    break
+        if original_action:
+            action = original_action
 
     result: Dict[str, object] = {
         "action":       action,
@@ -599,6 +657,60 @@ class PromotionView(ui.View):
 
     async def _decline(self, interaction: discord.Interaction) -> None:
         await self.cog._handle_promotion_decision(interaction, self.request_id, accepted=False)
+
+
+class PageView(ui.View):
+    """
+    Generic embed paginator — ◀  page / total  ▶ buttons.
+    Buttons disable automatically when at the first or last page.
+    The view expires after 5 minutes of inactivity.
+    """
+
+    def __init__(self, pages: List[discord.Embed], timeout: float = 300.0) -> None:
+        super().__init__(timeout=timeout)
+        self.pages   = pages
+        self.current = 0
+
+        self._btn_prev = ui.Button(
+            label="◀",
+            style=discord.ButtonStyle.secondary,
+            custom_id="pgv:prev",
+            disabled=True,
+        )
+        self._btn_prev.callback = self._go_prev
+        self.add_item(self._btn_prev)
+
+        self._btn_label = ui.Button(
+            label=f"1 / {len(pages)}",
+            style=discord.ButtonStyle.grey,
+            custom_id="pgv:label",
+            disabled=True,
+        )
+        self.add_item(self._btn_label)
+
+        self._btn_next = ui.Button(
+            label="▶",
+            style=discord.ButtonStyle.secondary,
+            custom_id="pgv:next",
+            disabled=len(pages) <= 1,
+        )
+        self._btn_next.callback = self._go_next
+        self.add_item(self._btn_next)
+
+    def _sync(self) -> None:
+        self._btn_prev.disabled = self.current == 0
+        self._btn_next.disabled = self.current >= len(self.pages) - 1
+        self._btn_label.label   = f"{self.current + 1} / {len(self.pages)}"
+
+    async def _go_prev(self, interaction: discord.Interaction) -> None:
+        self.current = max(0, self.current - 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    async def _go_next(self, interaction: discord.Interaction) -> None:
+        self.current = min(len(self.pages) - 1, self.current + 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
 
 
 # ---------------------------------------------------------------------------
@@ -1205,38 +1317,31 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     async def _before_weekly(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _post_activity_report(
+    def _build_activity_embeds(
         self,
         *,
+        guild: discord.Guild,
         period_label: str,
         week_key: str,
         week_dt: datetime,
         title_suffix: str = "",
-    ) -> None:
+    ) -> List[discord.Embed]:
         """
-        Core logic for posting a staff activity report.
-        Used by both the automatic weekly task and the manual !staffactivity command.
+        Build and return all embed pages for a staff activity report.
+        Index 0 is the header; subsequent entries are one per staff member.
+        Shared by the automatic weekly post and the paginated !staffactivity command.
         """
-        ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
-        if not ch:
-            return
-
-        # Always reload from disk so the report reflects the latest recorded actions
         self._mod_actions = _load(MOD_ACTIONS_FILE)
-
         now = datetime.now(timezone.utc)
 
-        # Resolve staff members from roles — only up to Senior Moderator
-        # Staff Management and above are excluded from the activity report
         ACTIVITY_RANKS = {"Trial Moderator", "Moderator", "Senior Moderator"}
-        role_map      = self._staff_role_map()
+        role_map       = self._staff_role_map()
         staff_role_ids = set(role_map.values())
-        staff_members: List[discord.Member] = []
-        for member in ch.guild.members:
-            if {r.id for r in member.roles} & staff_role_ids:
-                rank = self._member_rank(member)
-                if rank in ACTIVITY_RANKS:
-                    staff_members.append(member)
+        staff_members: List[discord.Member] = [
+            m for m in guild.members
+            if {r.id for r in m.roles} & staff_role_ids
+            and self._member_rank(m) in ACTIVITY_RANKS
+        ]
 
         header = discord.Embed(
             title=f"📊  Weekly Moderation Activity Report  {title_suffix}".strip(),
@@ -1248,18 +1353,18 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             timestamp=now,
         )
         header.set_footer(
-            text=f"Week {week_dt.strftime('%W')} · {week_dt.year}",
+            text=f"Week {week_dt.strftime('%W')} · {week_dt.year}  ·  {len(staff_members)} staff member(s)",
             icon_url=self.bot.user.display_avatar.url,
         )
-        await ch.send(embed=header)
 
         if not staff_members:
-            await ch.send(embed=discord.Embed(
+            no_staff = discord.Embed(
                 description="No staff members found with configured roles.",
                 color=0x95A5A6,
-            ))
-            return
+            )
+            return [header, no_staff]
 
+        pages: List[discord.Embed] = [header]
         for member in staff_members:
             actions      = self._week_actions(member.id, week_key)
             total        = sum(actions.values())
@@ -1282,19 +1387,16 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             if rank and tir:
                 embed.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
 
-            # Per-action breakdown with evidence links
             for a in ALL_ACTIONS:
                 count = actions.get(a, 0)
                 links = self._week_links(member.id, week_key, a)
                 if count == 0 and not links:
-                    # Show the action but with 0 and no links
                     embed.add_field(
                         name=f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}",
-                        value=f"**0**",
+                        value="**0**",
                         inline=True,
                     )
                 else:
-                    # Build evidence link list (cap at 10 to stay within field limit)
                     if links:
                         shown    = links[:10]
                         overflow = len(links) - 10
@@ -1314,6 +1416,30 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 text=f"User ID: {member.id}  ·  Period: {period_label}",
                 icon_url=self.bot.user.display_avatar.url,
             )
+            pages.append(embed)
+
+        return pages
+
+    async def _post_activity_report(
+        self,
+        *,
+        period_label: str,
+        week_key: str,
+        week_dt: datetime,
+        title_suffix: str = "",
+    ) -> None:
+        """Post the activity report to MOD_ACTIVITY_LOG_CHANNEL (used by the weekly task)."""
+        ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
+        if not ch:
+            return
+        pages = self._build_activity_embeds(
+            guild=ch.guild,
+            period_label=period_label,
+            week_key=week_key,
+            week_dt=week_dt,
+            title_suffix=title_suffix,
+        )
+        for embed in pages:
             await ch.send(embed=embed)
             await asyncio.sleep(0.5)
 
@@ -1951,46 +2077,72 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     ) -> None:
         """
         Show this week's and all-time mod action stats for a staff member.
+        Paginated: Page 1 = Overview, Page 2 = This Week, Page 3 = All-Time.
         Usage: !staffstats [@member]
         """
         target = member or ctx.author  # type: ignore[assignment]
-
-        # Always use fresh data from disk
         self._mod_actions = _load(MOD_ACTIONS_FILE)
 
         now      = datetime.now(timezone.utc)
         week_key = self._week_key()
         rank     = self._member_rank(target)  # type: ignore[arg-type]
 
-        # --- This week ---
         week_actions = self._week_actions(target.id, week_key)
         week_total   = sum(week_actions.values())
-
-        # --- All-time ---
         totals       = self._lifetime_totals(target.id)
         all_total    = sum(totals.values())
+        tir          = self._time_in_rank(target.id, rank) if rank else None
 
-        embed = discord.Embed(
+        footer_base = f"User ID: {target.id}  ·  Week: {week_key}"
+
+        # Helper — splits a list of text lines into embed fields, keeping each ≤ 1000 chars
+        def _add_fields(emb: discord.Embed, base_name: str, lines: List[str]) -> None:
+            chunk: List[str] = []
+            chunk_len = 0
+            part = 1
+            for line in lines:
+                line_len = len(line) + 1
+                if chunk_len + line_len > 1000 and chunk:
+                    label = base_name if part == 1 else f"{base_name} (cont.)"
+                    emb.add_field(name=label, value="\n".join(chunk), inline=False)
+                    chunk = []
+                    chunk_len = 0
+                    part += 1
+                chunk.append(line)
+                chunk_len += line_len
+            if chunk:
+                label = base_name if part == 1 else f"{base_name} (cont.)"
+                emb.add_field(name=label, value="\n".join(chunk), inline=False)
+
+        # ── Page 1 — Overview ────────────────────────────────────────────
+        p1 = discord.Embed(
             title=f"📊  Staff Statistics — {target.display_name}",
             color=0x5865F2,
             timestamp=now,
         )
-        embed.set_author(name=str(target), icon_url=target.display_avatar.url)
-        embed.add_field(
+        p1.set_author(name=str(target), icon_url=target.display_avatar.url)
+        p1.add_field(
             name="🏅  Rank",
             value=f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Not staff",
             inline=True,
         )
-        embed.add_field(name="📅  This Week",  value=str(week_total), inline=True)
-        embed.add_field(name="📈  All-Time",   value=str(all_total),  inline=True)
+        p1.add_field(name="📅  This Week",  value=str(week_total), inline=True)
+        p1.add_field(name="📈  All-Time",   value=str(all_total),  inline=True)
+        if rank and tir:
+            p1.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
+        p1.set_footer(
+            text=f"{footer_base}  ·  Page 1/3 — Overview",
+            icon_url=self.bot.user.display_avatar.url,
+        )
 
-        if rank:
-            tir = self._time_in_rank(target.id, rank)
-            if tir:
-                embed.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
-
-        # --- This week breakdown with evidence links ---
-        week_lines = []
+        # ── Page 2 — This Week breakdown with evidence links ─────────────
+        p2 = discord.Embed(
+            title=f"📋  This Week — {target.display_name}",
+            color=0x5865F2,
+            timestamp=now,
+        )
+        p2.set_author(name=str(target), icon_url=target.display_avatar.url)
+        week_lines: List[str] = []
         for a in ALL_ACTIONS:
             count = week_actions.get(a, 0)
             links = self._week_links(target.id, week_key, a)
@@ -2003,37 +2155,31 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}{link_str}")
             else:
                 week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}")
+        _add_fields(p2, "📋  This Week Breakdown", week_lines)
+        p2.set_footer(
+            text=f"{footer_base}  ·  Page 2/3 — This Week",
+            icon_url=self.bot.user.display_avatar.url,
+        )
 
-        # Split into multiple fields if content exceeds Discord's 1024-char limit
-        def _add_fields(embed: discord.Embed, base_name: str, lines: List[str]) -> None:
-            chunk: List[str] = []
-            chunk_len = 0
-            part = 1
-            for line in lines:
-                line_len = len(line) + 1  # +1 for newline
-                if chunk_len + line_len > 1000 and chunk:
-                    label = base_name if part == 1 else f"{base_name} (cont.)"
-                    embed.add_field(name=label, value="\n".join(chunk), inline=False)
-                    chunk = []
-                    chunk_len = 0
-                    part += 1
-                chunk.append(line)
-                chunk_len += line_len
-            if chunk:
-                label = base_name if part == 1 else f"{base_name} (cont.)"
-                embed.add_field(name=label, value="\n".join(chunk), inline=False)
-
-        _add_fields(embed, "📋  This Week Breakdown", week_lines)
-
-        # --- All-time breakdown ---
+        # ── Page 3 — All-Time breakdown ──────────────────────────────────
+        p3 = discord.Embed(
+            title=f"🗂️  All-Time — {target.display_name}",
+            color=0x5865F2,
+            timestamp=now,
+        )
+        p3.set_author(name=str(target), icon_url=target.display_avatar.url)
         alltime_lines = [
             f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {totals.get(a, 0)}"
             for a in ALL_ACTIONS
         ]
-        _add_fields(embed, "🗂️  All-Time Breakdown", alltime_lines)
+        _add_fields(p3, "🗂️  All-Time Breakdown", alltime_lines)
+        p3.set_footer(
+            text=f"{footer_base}  ·  Page 3/3 — All-Time",
+            icon_url=self.bot.user.display_avatar.url,
+        )
 
-        embed.set_footer(text=f"User ID: {target.id}  ·  Week: {week_key}", icon_url=self.bot.user.display_avatar.url)
-        await ctx.send(embed=embed)
+        view = PageView([p1, p2, p3])
+        await ctx.send(embed=p1, view=view)
 
     @commands.command(name="staffactivity", aliases=["activityreport", "weeklyreport"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
@@ -2043,32 +2189,27 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         week_offset: int = 0,
     ) -> None:
         """
-        Manually post the full staff activity report to the activity log channel.
-        Posts stats for EVERY staff member in STAFF_IDS for the selected week.
+        Show a paginated staff activity report (one page per staff member).
+        Page 1 is the summary header; subsequent pages are per-member breakdowns.
         Usage: !staffactivity [week_offset]
           week_offset: 0 = current week (default), 1 = last week, 2 = two weeks ago
 
         Examples:
-          !staffactivity        — posts the current (ongoing) week (default)
-          !staffactivity 1      — posts last week's report
-          !staffactivity 2      — posts two weeks ago
+          !staffactivity        — current week
+          !staffactivity 1      — last week
+          !staffactivity 2      — two weeks ago
         """
-        ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
-        if not ch:
+        if not ctx.guild:
             await ctx.send(
-                embed=discord.Embed(
-                    description="❌ Activity log channel (`MOD_ACTIVITY_LOG_CHANNEL`) is not configured.",
-                    color=0xE74C3C,
-                ),
+                embed=discord.Embed(description="❌ Must be used in a server.", color=0xE74C3C),
                 delete_after=10,
             )
             return
 
-        now      = datetime.now(timezone.utc)
+        now       = datetime.now(timezone.utc)
         target_dt = now - timedelta(weeks=week_offset)
         week_key  = self._week_key(target_dt)
 
-        # Calculate the Monday–Sunday range for the selected week
         monday = (target_dt - timedelta(days=target_dt.weekday())).replace(
             hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
         )
@@ -2077,13 +2218,16 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         period_label = f"{ts(monday, 'D')} — {ts(sunday, 'D')}"
         suffix       = "(Manual)" if week_offset == 0 else f"(Manual — {week_offset} week{'s' if week_offset != 1 else ''} ago)"
 
-        await ctx.message.add_reaction("✅")
-        await self._post_activity_report(
+        pages = self._build_activity_embeds(
+            guild=ctx.guild,
             period_label=period_label,
             week_key=week_key,
             week_dt=target_dt,
             title_suffix=suffix,
         )
+        await ctx.message.add_reaction("✅")
+        view = PageView(pages)
+        await ctx.send(embed=pages[0], view=view)
 
     @commands.command(name="modlogdelete", aliases=["delmodlog", "deletemodlog", "modlogdel"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
