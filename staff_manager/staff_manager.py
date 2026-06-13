@@ -173,6 +173,18 @@ REVERSE_ACTION_MAP: Dict[str, str] = {
     "delnote":    "note",
 }
 
+# Frozenset of all reversal-action keys — used for priority matching in the parser.
+_REVERSAL_KEYS: frozenset = frozenset(REVERSE_ACTION_MAP.keys())
+
+# Matches "Case #123 Deleted / Removed" patterns where a case number sits between
+# the noun and the verb, making plain substring keywords unable to match.
+_NUMBERED_DEL_RE = re.compile(
+    r"\bcase\s*#?\d+\s+(?:delet|remov)ed?\b"
+    r"|\bwarn(?:ing)?\s*#?\d+\s+(?:delet|remov)ed?\b"
+    r"|\binfraction\s*#?\d+\s+(?:delet|remov)ed?\b",
+    re.IGNORECASE,
+)
+
 # Embed text patterns that indicate a *lookup/list* command, not a new action.
 # These are checked before DYNO_TITLE_MAP and will cause the embed to be skipped.
 _LOOKUP_PATTERNS = re.compile(
@@ -302,12 +314,31 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     if _LOOKUP_PATTERNS.search(full_text):
         return None
 
-    # --- Match action keyword (longest phrase first to avoid partial hits) ---
+    # --- Match action keyword ---
+    # Deletion/reversal keywords get an explicit first pass so that forward-action
+    # phrases inside a case-deletion embed's description (e.g. "Member warned" shown
+    # as the original action) can never shadow the true deletion intent.
+    #
+    # Additionally, "Case #123 Deleted" / "Warn #5 Removed" contain a case number
+    # that breaks plain substring matching — catch those with a regex pre-check.
     action: Optional[str] = None
-    for keyword in sorted(DYNO_TITLE_MAP, key=len, reverse=True):
-        if keyword in full_text:
-            action = DYNO_TITLE_MAP[keyword]
-            break
+
+    if _NUMBERED_DEL_RE.search(title_str) or _NUMBERED_DEL_RE.search(author_str):
+        # Title explicitly says "Case #N deleted/removed" → it is always a deletion
+        action = "delcase"
+    else:
+        # Pass 1 — deletion/reversal keywords (highest priority, scans full text)
+        for keyword in sorted(DYNO_TITLE_MAP, key=len, reverse=True):
+            if DYNO_TITLE_MAP[keyword] in _REVERSAL_KEYS and keyword in full_text:
+                action = DYNO_TITLE_MAP[keyword]
+                break
+        # Pass 2 — forward action keywords (only reached if no reversal was found)
+        if action is None:
+            for keyword in sorted(DYNO_TITLE_MAP, key=len, reverse=True):
+                if keyword in full_text:
+                    action = DYNO_TITLE_MAP[keyword]
+                    break
+
     if action is None:
         return None
 
