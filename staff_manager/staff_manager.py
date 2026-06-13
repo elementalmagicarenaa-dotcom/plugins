@@ -895,14 +895,23 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         _save(MOD_ACTIONS_FILE, self._mod_actions)
 
     def _remove_action(self, moderator_id: int, action: str, link: Optional[str] = None) -> None:
-        """Decrement the action counter and remove the evidence link (for deletions)."""
+        """
+        Decrement the action counter and remove one evidence link (for deletions).
+
+        If a specific link URL is supplied (e.g. from !modlogdelete), that exact URL is
+        removed from the links list.  If no link is supplied (Dyno case-deleted flow,
+        where we only know the action type), the most-recently-added link is popped so
+        the visible link count stays in sync with the action count.
+        """
         self._mod_actions = _load(MOD_ACTIONS_FILE)
-        uid = str(moderator_id)
+        uid       = str(moderator_id)
         links_key = f"{action}_links"
+
         for week_data in self._mod_actions.values():
             uid_data = week_data.get(uid, {})
-            # Locate the correct week by matching the link (if provided)
+
             if link:
+                # Exact-link removal — find the week that has this URL
                 stored_links = uid_data.get(links_key, [])
                 if link not in stored_links:
                     continue
@@ -910,14 +919,25 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 if not stored_links:
                     uid_data.pop(links_key, None)
             elif action not in uid_data:
+                # No count for this action in this week — skip
                 continue
-            # Decrement count
+            else:
+                # No specific link: pop the most-recently-added one (keeps count ↔ links in sync)
+                stored_links = uid_data.get(links_key, [])
+                if stored_links:
+                    stored_links.pop()
+                    if not stored_links:
+                        uid_data.pop(links_key, None)
+
+            # Decrement the counter
             if action in uid_data:
                 uid_data[action] = max(0, uid_data[action] - 1)
                 if uid_data[action] == 0:
                     uid_data.pop(action, None)
+
             _save(MOD_ACTIONS_FILE, self._mod_actions)
             return
+
         _save(MOD_ACTIONS_FILE, self._mod_actions)
 
     # ------------------------------------------------------------------ #
