@@ -33,7 +33,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import discord
 from discord import ui
@@ -1317,6 +1317,85 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     async def _before_weekly(self) -> None:
         await self.bot.wait_until_ready()
 
+    def _action_field_chunks(
+        self,
+        a: str,
+        count: int,
+        links: List[str],
+    ) -> List[Tuple[str, str]]:
+        """
+        Convert one action + all its evidence links into one or more (name, value) tuples.
+        Splits at 1000 chars so each field stays inside Discord's 1024-char limit.
+        Extra chunks get a "↳ (cont.)" name so the paginator can spill them to new pages.
+        """
+        base_name = f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}"
+        if not links:
+            return [(base_name, f"**{count}**")]
+
+        result: List[Tuple[str, str]] = []
+        chunk_lines: List[str] = [f"**{count}**"]
+        chunk_chars = len(chunk_lines[0]) + 1
+        first_field = True
+
+        for i, url in enumerate(links):
+            line     = f"[Log {i + 1}]({url})"
+            line_len = len(line) + 1
+            if chunk_chars + line_len > 1000 and len(chunk_lines) > 1:
+                name = base_name if first_field else f"↳ {ACTION_LABELS[a]} (cont.)"
+                result.append((name, "\n".join(chunk_lines)))
+                chunk_lines = []
+                chunk_chars = 0
+                first_field = False
+            chunk_lines.append(line)
+            chunk_chars += line_len
+
+        if chunk_lines:
+            name = base_name if first_field else f"↳ {ACTION_LABELS[a]} (cont.)"
+            result.append((name, "\n".join(chunk_lines)))
+
+        return result
+
+    def _fields_to_pages(
+        self,
+        field_tuples: List[Tuple[str, str]],
+        embed_factory: Callable[[], discord.Embed],
+        first_embed: Optional[discord.Embed] = None,
+    ) -> List[discord.Embed]:
+        """
+        Pack (name, value) field tuples into as many discord.Embeds as needed.
+        Starts filling first_embed (if given) before creating new embeds via embed_factory.
+        A new embed is created when the current one would exceed 5 800 chars or 24 fields.
+        """
+        MAX_CHARS  = 5800
+        MAX_FIELDS = 24
+
+        def _used(emb: discord.Embed) -> int:
+            chars = 0
+            for s in (emb.title, emb.description,
+                      emb.author.name if emb.author else None,
+                      emb.footer.text if emb.footer else None):
+                if s:
+                    chars += len(s)
+            for f in emb.fields:
+                chars += len(f.name or "") + len(f.value or "")
+            return chars
+
+        pages: List[discord.Embed] = []
+        current = first_embed if first_embed is not None else embed_factory()
+        used    = _used(current)
+
+        for name, value in field_tuples:
+            fc = len(name) + len(value)
+            if (len(current.fields) >= MAX_FIELDS or used + fc > MAX_CHARS) and current.fields:
+                pages.append(current)
+                current = embed_factory()
+                used    = _used(current)
+            current.add_field(name=name, value=value, inline=True)
+            used += fc
+
+        pages.append(current)
+        return pages
+
     def _build_activity_embeds(
         self,
         *,
@@ -1328,8 +1407,8 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     ) -> List[discord.Embed]:
         """
         Build and return all embed pages for a staff activity report.
-        Index 0 is the header; subsequent entries are one per staff member.
-        Shared by the automatic weekly post and the paginated !staffactivity command.
+        Page 0 is the header; subsequent pages are per-member breakdowns.
+        Each member may span multiple pages when they have many evidence links.
         """
         self._mod_actions = _load(MOD_ACTIONS_FILE)
         now = datetime.now(timezone.utc)
@@ -1371,52 +1450,52 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             rank         = self._member_rank(member)
             rank_display = f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Staff"
             tir          = self._time_in_rank(member.id, rank) if rank else None
+            color        = 0x5865F2 if total > 0 else 0x95A5A6
 
-            embed = discord.Embed(
+            # First embed for this member — pre-populate summary header fields
+            first_embed = discord.Embed(
                 title=f"Staff Activity — {member.display_name}",
-                color=0x5865F2 if total > 0 else 0x95A5A6,
+                color=color,
                 timestamp=now,
             )
-            embed.set_author(
+            first_embed.set_author(
                 name=f"{member.display_name}  ·  {rank_display}",
                 icon_url=member.display_avatar.url,
             )
-            embed.add_field(name="👤  Staff Member",  value=member.mention,   inline=True)
-            embed.add_field(name="🏅  Rank",          value=rank_display,     inline=True)
-            embed.add_field(name="📈  Total Actions", value=str(total),       inline=True)
+            first_embed.add_field(name="👤  Staff Member",  value=member.mention,   inline=True)
+            first_embed.add_field(name="🏅  Rank",          value=rank_display,     inline=True)
+            first_embed.add_field(name="📈  Total Actions", value=str(total),       inline=True)
             if rank and tir:
-                embed.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
-
-            for a in ALL_ACTIONS:
-                count = actions.get(a, 0)
-                links = self._week_links(member.id, week_key, a)
-                if count == 0 and not links:
-                    embed.add_field(
-                        name=f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}",
-                        value="**0**",
-                        inline=True,
-                    )
-                else:
-                    if links:
-                        shown    = links[:10]
-                        overflow = len(links) - 10
-                        link_str = "\n".join(f"[Log {i+1}]({url})" for i, url in enumerate(shown))
-                        if overflow > 0:
-                            link_str += f"\n*…and {overflow} more*"
-                        value = f"**{count}**\n{link_str}"
-                    else:
-                        value = f"**{count}**"
-                    embed.add_field(
-                        name=f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}",
-                        value=value,
-                        inline=True,
-                    )
-
-            embed.set_footer(
+                first_embed.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
+            first_embed.set_footer(
                 text=f"User ID: {member.id}  ·  Period: {period_label}",
                 icon_url=self.bot.user.display_avatar.url,
             )
-            pages.append(embed)
+
+            # Gather action fields — each action may produce multiple tuples if links overflow
+            action_fields: List[Tuple[str, str]] = []
+            for a in ALL_ACTIONS:
+                action_fields.extend(
+                    self._action_field_chunks(
+                        a, actions.get(a, 0), self._week_links(member.id, week_key, a)
+                    )
+                )
+
+            # Continuation embed factory (used only when action fields overflow the first embed)
+            def _cont(m=member, rd=rank_display, pl=period_label, c=color) -> discord.Embed:
+                e = discord.Embed(
+                    title=f"Staff Activity — {m.display_name}  (cont.)",
+                    color=c,
+                    timestamp=now,
+                )
+                e.set_author(name=f"{m.display_name}  ·  {rd}", icon_url=m.display_avatar.url)
+                e.set_footer(
+                    text=f"User ID: {m.id}  ·  Period: {pl}",
+                    icon_url=self.bot.user.display_avatar.url,
+                )
+                return e
+
+            pages.extend(self._fields_to_pages(action_fields, _cont, first_embed=first_embed))
 
         return pages
 
@@ -2092,27 +2171,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         totals       = self._lifetime_totals(target.id)
         all_total    = sum(totals.values())
         tir          = self._time_in_rank(target.id, rank) if rank else None
-
-        footer_base = f"User ID: {target.id}  ·  Week: {week_key}"
-
-        # Helper — splits a list of text lines into embed fields, keeping each ≤ 1000 chars
-        def _add_fields(emb: discord.Embed, base_name: str, lines: List[str]) -> None:
-            chunk: List[str] = []
-            chunk_len = 0
-            part = 1
-            for line in lines:
-                line_len = len(line) + 1
-                if chunk_len + line_len > 1000 and chunk:
-                    label = base_name if part == 1 else f"{base_name} (cont.)"
-                    emb.add_field(name=label, value="\n".join(chunk), inline=False)
-                    chunk = []
-                    chunk_len = 0
-                    part += 1
-                chunk.append(line)
-                chunk_len += line_len
-            if chunk:
-                label = base_name if part == 1 else f"{base_name} (cont.)"
-                emb.add_field(name=label, value="\n".join(chunk), inline=False)
+        footer_base  = f"User ID: {target.id}  ·  Week: {week_key}"
 
         # ── Page 1 — Overview ────────────────────────────────────────────
         p1 = discord.Embed(
@@ -2131,54 +2190,51 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         if rank and tir:
             p1.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
         p1.set_footer(
-            text=f"{footer_base}  ·  Page 1/3 — Overview",
+            text=f"{footer_base}  ·  Overview",
             icon_url=self.bot.user.display_avatar.url,
         )
 
-        # ── Page 2 — This Week breakdown with evidence links ─────────────
-        p2 = discord.Embed(
-            title=f"📋  This Week — {target.display_name}",
-            color=0x5865F2,
-            timestamp=now,
-        )
-        p2.set_author(name=str(target), icon_url=target.display_avatar.url)
-        week_lines: List[str] = []
+        # ── Pages 2… — This Week (all links shown; overflows to extra pages) ──
+        week_fields: List[Tuple[str, str]] = []
         for a in ALL_ACTIONS:
-            count = week_actions.get(a, 0)
-            links = self._week_links(target.id, week_key, a)
-            if links:
-                shown    = links[:3]
-                overflow = len(links) - 3
-                link_str = "  " + "  ".join(f"[{i+1}]({u})" for i, u in enumerate(shown))
-                if overflow > 0:
-                    link_str += f" *+{overflow}*"
-                week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}{link_str}")
-            else:
-                week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}")
-        _add_fields(p2, "📋  This Week Breakdown", week_lines)
-        p2.set_footer(
-            text=f"{footer_base}  ·  Page 2/3 — This Week",
-            icon_url=self.bot.user.display_avatar.url,
-        )
+            week_fields.extend(
+                self._action_field_chunks(
+                    a, week_actions.get(a, 0), self._week_links(target.id, week_key, a)
+                )
+            )
 
-        # ── Page 3 — All-Time breakdown ──────────────────────────────────
-        p3 = discord.Embed(
-            title=f"🗂️  All-Time — {target.display_name}",
-            color=0x5865F2,
-            timestamp=now,
-        )
-        p3.set_author(name=str(target), icon_url=target.display_avatar.url)
-        alltime_lines = [
-            f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {totals.get(a, 0)}"
+        def _week_factory() -> discord.Embed:
+            e = discord.Embed(
+                title=f"📋  This Week — {target.display_name}",
+                color=0x5865F2,
+                timestamp=now,
+            )
+            e.set_author(name=str(target), icon_url=target.display_avatar.url)
+            e.set_footer(text=f"{footer_base}  ·  This Week", icon_url=self.bot.user.display_avatar.url)
+            return e
+
+        week_pages = self._fields_to_pages(week_fields, _week_factory)
+
+        # ── Final pages — All-Time ────────────────────────────────────────
+        alltime_fields: List[Tuple[str, str]] = [
+            (f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}", f"**{totals.get(a, 0)}**")
             for a in ALL_ACTIONS
         ]
-        _add_fields(p3, "🗂️  All-Time Breakdown", alltime_lines)
-        p3.set_footer(
-            text=f"{footer_base}  ·  Page 3/3 — All-Time",
-            icon_url=self.bot.user.display_avatar.url,
-        )
 
-        view = PageView([p1, p2, p3])
+        def _alltime_factory() -> discord.Embed:
+            e = discord.Embed(
+                title=f"🗂️  All-Time — {target.display_name}",
+                color=0x5865F2,
+                timestamp=now,
+            )
+            e.set_author(name=str(target), icon_url=target.display_avatar.url)
+            e.set_footer(text=f"{footer_base}  ·  All-Time", icon_url=self.bot.user.display_avatar.url)
+            return e
+
+        alltime_pages = self._fields_to_pages(alltime_fields, _alltime_factory)
+
+        all_pages = [p1] + week_pages + alltime_pages
+        view = PageView(all_pages)
         await ctx.send(embed=p1, view=view)
 
     @commands.command(name="staffactivity", aliases=["activityreport", "weeklyreport"])
@@ -2199,9 +2255,13 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
           !staffactivity 1      — last week
           !staffactivity 2      — two weeks ago
         """
-        if not ctx.guild:
+        ch = self._channel("MOD_ACTIVITY_LOG_CHANNEL")
+        if not ch:
             await ctx.send(
-                embed=discord.Embed(description="❌ Must be used in a server.", color=0xE74C3C),
+                embed=discord.Embed(
+                    description="❌ Activity log channel (`MOD_ACTIVITY_LOG_CHANNEL`) is not configured.",
+                    color=0xE74C3C,
+                ),
                 delete_after=10,
             )
             return
@@ -2219,7 +2279,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         suffix       = "(Manual)" if week_offset == 0 else f"(Manual — {week_offset} week{'s' if week_offset != 1 else ''} ago)"
 
         pages = self._build_activity_embeds(
-            guild=ctx.guild,
+            guild=ch.guild,
             period_label=period_label,
             week_key=week_key,
             week_dt=target_dt,
@@ -2227,7 +2287,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         )
         await ctx.message.add_reaction("✅")
         view = PageView(pages)
-        await ctx.send(embed=pages[0], view=view)
+        await ch.send(embed=pages[0], view=view)
 
     @commands.command(name="modlogdelete", aliases=["delmodlog", "deletemodlog", "modlogdel"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
