@@ -1995,8 +1995,8 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             count = week_actions.get(a, 0)
             links = self._week_links(target.id, week_key, a)
             if links:
-                shown    = links[:5]
-                overflow = len(links) - 5
+                shown    = links[:3]
+                overflow = len(links) - 3
                 link_str = "  " + "  ".join(f"[{i+1}]({u})" for i, u in enumerate(shown))
                 if overflow > 0:
                     link_str += f" *+{overflow}*"
@@ -2004,22 +2004,33 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             else:
                 week_lines.append(f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {count}")
 
-        embed.add_field(
-            name="📋  This Week Breakdown",
-            value="\n".join(week_lines),
-            inline=False,
-        )
+        # Split into multiple fields if content exceeds Discord's 1024-char limit
+        def _add_fields(embed: discord.Embed, base_name: str, lines: List[str]) -> None:
+            chunk: List[str] = []
+            chunk_len = 0
+            part = 1
+            for line in lines:
+                line_len = len(line) + 1  # +1 for newline
+                if chunk_len + line_len > 1000 and chunk:
+                    label = base_name if part == 1 else f"{base_name} (cont.)"
+                    embed.add_field(name=label, value="\n".join(chunk), inline=False)
+                    chunk = []
+                    chunk_len = 0
+                    part += 1
+                chunk.append(line)
+                chunk_len += line_len
+            if chunk:
+                label = base_name if part == 1 else f"{base_name} (cont.)"
+                embed.add_field(name=label, value="\n".join(chunk), inline=False)
+
+        _add_fields(embed, "📋  This Week Breakdown", week_lines)
 
         # --- All-time breakdown ---
         alltime_lines = [
             f"{ACTION_ICONS[a]} **{ACTION_LABELS[a]}:** {totals.get(a, 0)}"
             for a in ALL_ACTIONS
         ]
-        embed.add_field(
-            name="🗂️  All-Time Breakdown",
-            value="\n".join(alltime_lines),
-            inline=False,
-        )
+        _add_fields(embed, "🗂️  All-Time Breakdown", alltime_lines)
 
         embed.set_footer(text=f"User ID: {target.id}  ·  Week: {week_key}", icon_url=self.bot.user.display_avatar.url)
         await ctx.send(embed=embed)
