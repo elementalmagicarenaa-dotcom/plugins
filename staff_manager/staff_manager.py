@@ -1445,9 +1445,8 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             week_dt=week_dt,
             title_suffix=title_suffix,
         )
-        for embed in pages:
-            await ch.send(embed=embed)
-            await asyncio.sleep(0.5)
+        view = PageView(pages)
+        await ch.send(embed=pages[0], view=view)
 
     # ------------------------------------------------------------------ #
     # LOA expiry checker                                                   #
@@ -1573,6 +1572,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         label = "✅ Accepted" if accepted else "❌ Declined"
         color = 0x2ECC71 if accepted else 0xE74C3C
 
+        new_embed: Optional[discord.Embed] = None
         if interaction.message and interaction.message.embeds:
             old = interaction.message.embeds[0]
             new_embed = discord.Embed(
@@ -1582,7 +1582,11 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 timestamp=old.timestamp,
             )
             for f in old.fields:
-                new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
+                # Update the Status field in-place instead of copying it stale
+                if "status" in (f.name or "").lower():
+                    new_embed.add_field(name=f.name, value=label, inline=f.inline)
+                else:
+                    new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
             new_embed.add_field(
                 name="📋  Decision",
                 value=f"{label} by {interaction.user.mention}\n{ts(now, 'F')}",
@@ -1598,9 +1602,14 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 new_embed.set_footer(text=old.footer.text, icon_url=old.footer.icon_url)
             if old.author.name:
                 new_embed.set_author(name=old.author.name, icon_url=old.author.icon_url)
-            await interaction.message.edit(embed=new_embed, view=None)
 
-        await interaction.response.send_message(
+        # Respond to the interaction by editing the message (must be first API call)
+        if new_embed:
+            await interaction.response.edit_message(embed=new_embed, view=None)
+        else:
+            await interaction.response.defer(ephemeral=True)
+
+        await interaction.followup.send(
             f"{label} by {interaction.user.mention}.", ephemeral=True
         )
 
@@ -1687,6 +1696,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         label = "✅ Accepted" if accepted else "❌ Declined"
         color = 0x2ECC71 if accepted else 0xE74C3C
 
+        new_embed: Optional[discord.Embed] = None
         if interaction.message and interaction.message.embeds:
             old = interaction.message.embeds[0]
             new_embed = discord.Embed(
@@ -1696,7 +1706,11 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 timestamp=old.timestamp,
             )
             for f in old.fields:
-                new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
+                # Update the Status field in-place instead of copying it stale
+                if "status" in (f.name or "").lower():
+                    new_embed.add_field(name=f.name, value=label, inline=f.inline)
+                else:
+                    new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
             new_embed.add_field(
                 name="📋  Decision",
                 value=f"{label} by {interaction.user.mention}\n{ts(now, 'F')}",
@@ -1708,9 +1722,14 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 new_embed.set_author(name=old.author.name, icon_url=old.author.icon_url)
             if old.thumbnail.url:
                 new_embed.set_thumbnail(url=old.thumbnail.url)
-            await interaction.message.edit(embed=new_embed, view=None)
 
-        await interaction.response.send_message(
+        # Respond to the interaction by editing the message (must be first API call)
+        if new_embed:
+            await interaction.response.edit_message(embed=new_embed, view=None)
+        else:
+            await interaction.response.defer(ephemeral=True)
+
+        await interaction.followup.send(
             f"{label} by {interaction.user.mention}.", ephemeral=True
         )
 
@@ -2082,87 +2101,93 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         member: Optional[discord.Member] = None,
     ) -> None:
         """
-        Show this week's and all-time mod action stats for a staff member.
-        Paginated: Page 1 = Overview, Page 2 = This Week, Page 3 = All-Time.
+        Show mod action stats for a staff member, one page per action type.
+        Pages: Warns → Mutes → Kicks → Bans → Softbans → Notes → Tickets Closed.
+        Each page shows this week's count + evidence links and the all-time total.
         Usage: !staffstats [@member]
         """
         target = member or ctx.author  # type: ignore[assignment]
         self._mod_actions = _load(MOD_ACTIONS_FILE)
 
-        now      = datetime.now(timezone.utc)
-        week_key = self._week_key()
-        rank     = self._member_rank(target)  # type: ignore[arg-type]
-
+        now         = datetime.now(timezone.utc)
+        week_key    = self._week_key()
+        rank        = self._member_rank(target)  # type: ignore[arg-type]
+        rank_display = f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Staff"
+        tir         = self._time_in_rank(target.id, rank) if rank else None
         week_actions = self._week_actions(target.id, week_key)
-        week_total   = sum(week_actions.values())
         totals       = self._lifetime_totals(target.id)
-        all_total    = sum(totals.values())
-        tir          = self._time_in_rank(target.id, rank) if rank else None
         footer_base  = f"User ID: {target.id}  ·  Week: {week_key}"
 
-        # ── Page 1 — Overview ────────────────────────────────────────────
-        p1 = discord.Embed(
-            title=f"📊  Staff Statistics — {target.display_name}",
-            color=0x5865F2,
-            timestamp=now,
-        )
-        p1.set_author(name=str(target), icon_url=target.display_avatar.url)
-        p1.add_field(
-            name="🏅  Rank",
-            value=f"{RANK_EMOJIS.get(rank, '')} {rank}" if rank else "Not staff",
-            inline=True,
-        )
-        p1.add_field(name="📅  This Week",  value=str(week_total), inline=True)
-        p1.add_field(name="📈  All-Time",   value=str(all_total),  inline=True)
-        if rank and tir:
-            p1.add_field(name=f"⏳  Time as {rank}", value=format_duration(tir), inline=True)
-        p1.set_footer(
-            text=f"{footer_base}  ·  Overview",
-            icon_url=self.bot.user.display_avatar.url,
-        )
+        pages: List[discord.Embed] = []
 
-        # ── Pages 2… — This Week (all links shown; overflows to extra pages) ──
-        week_fields: List[Tuple[str, str]] = []
-        for a in ALL_ACTIONS:
-            week_fields.extend(
-                self._action_field_chunks(
-                    a, week_actions.get(a, 0), self._week_links(target.id, week_key, a)
+        for idx, a in enumerate(ALL_ACTIONS):
+            icon    = ACTION_ICONS.get(a, "🔹")
+            label   = ACTION_LABELS.get(a, a.capitalize())
+            color   = ACTION_COLORS.get(a, 0x5865F2)
+            count_w = week_actions.get(a, 0)
+            count_t = totals.get(a, 0)
+            links   = self._week_links(target.id, week_key, a)
+
+            def _make(lbl=label, ic=icon, col=color, cont: bool = False) -> discord.Embed:
+                title = f"{ic}  {lbl}" + ("  (cont.)" if cont else "")
+                e = discord.Embed(title=title, color=col, timestamp=now)
+                e.set_author(
+                    name=f"{target.display_name}  ·  {rank_display}",
+                    icon_url=target.display_avatar.url,
                 )
-            )
+                e.set_footer(
+                    text=f"{footer_base}  ·  {lbl}",
+                    icon_url=self.bot.user.display_avatar.url,
+                )
+                return e
 
-        def _week_factory() -> discord.Embed:
-            e = discord.Embed(
-                title=f"📋  This Week — {target.display_name}",
-                color=0x5865F2,
-                timestamp=now,
-            )
-            e.set_author(name=str(target), icon_url=target.display_avatar.url)
-            e.set_footer(text=f"{footer_base}  ·  This Week", icon_url=self.bot.user.display_avatar.url)
-            return e
+            first_page = _make()
+            first_page.add_field(name="📅  This Week", value=str(count_w), inline=True)
+            first_page.add_field(name="📈  All-Time",  value=str(count_t), inline=True)
+            # Show rank / time-in-rank once, on the first action's page
+            if idx == 0 and rank and tir:
+                first_page.add_field(
+                    name=f"⏳  Time as {rank}",
+                    value=format_duration(tir),
+                    inline=True,
+                )
 
-        week_pages = self._fields_to_pages(week_fields, _week_factory)
+            # Chunk evidence links (each chunk fits inside a 1000-char field)
+            if links:
+                link_chunks: List[List[str]] = []
+                chunk_buf: List[str] = []
+                chunk_len = 0
+                for i, url in enumerate(links):
+                    line = f"[Log {i + 1}]({url})"
+                    if chunk_len + len(line) + 1 > 1000 and chunk_buf:
+                        link_chunks.append(chunk_buf)
+                        chunk_buf = []
+                        chunk_len = 0
+                    chunk_buf.append(line)
+                    chunk_len += len(line) + 1
+                if chunk_buf:
+                    link_chunks.append(chunk_buf)
 
-        # ── Final pages — All-Time ────────────────────────────────────────
-        alltime_fields: List[Tuple[str, str]] = [
-            (f"{ACTION_ICONS[a]}  {ACTION_LABELS[a]}", f"**{totals.get(a, 0)}**")
-            for a in ALL_ACTIONS
-        ]
+                first_page.add_field(
+                    name="🔗  Evidence — This Week",
+                    value="\n".join(link_chunks[0]),
+                    inline=False,
+                )
+                pages.append(first_page)
 
-        def _alltime_factory() -> discord.Embed:
-            e = discord.Embed(
-                title=f"🗂️  All-Time — {target.display_name}",
-                color=0x5865F2,
-                timestamp=now,
-            )
-            e.set_author(name=str(target), icon_url=target.display_avatar.url)
-            e.set_footer(text=f"{footer_base}  ·  All-Time", icon_url=self.bot.user.display_avatar.url)
-            return e
+                for lc in link_chunks[1:]:
+                    cont_page = _make(cont=True)
+                    cont_page.add_field(
+                        name="🔗  Evidence (cont.)",
+                        value="\n".join(lc),
+                        inline=False,
+                    )
+                    pages.append(cont_page)
+            else:
+                pages.append(first_page)
 
-        alltime_pages = self._fields_to_pages(alltime_fields, _alltime_factory)
-
-        all_pages = [p1] + week_pages + alltime_pages
-        view = PageView(all_pages)
-        await ctx.send(embed=p1, view=view)
+        view = PageView(pages)
+        await ctx.send(embed=pages[0], view=view)
 
     @commands.command(name="staffactivity", aliases=["activityreport", "weeklyreport"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
@@ -2519,71 +2544,55 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 totals = self._lifetime_totals(m.id)
                 scores[m.id] = totals.get(action, 0) if action != "total" else sum(totals.values())
 
-        # Sort descending
+        # Sort descending; cap at 10 per page
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-        # Medal emojis for top 3
-        medals = ["🥇", "🥈", "🥉"]
-
+        medals       = ["🥇", "🥈", "🥉"]
         scope_label  = "This Week" if scope == "week" else "All-Time"
         action_label = "Total Actions" if action == "total" else ACTION_LABELS.get(action, action.capitalize())
+        act_icon     = ACTION_ICONS.get(action, "📈") if action != "total" else "📈"
+        member_map   = {m.id: m for m in staff_members_lb}
 
-        embed = discord.Embed(
-            title=f"🏆  Staff Leaderboard — {scope_label}",
-            description=f"**Ranked by:** {action_label}",
-            color=0xF1C40F,
-            timestamp=now,
-        )
+        PER_PAGE = 10
+        lb_pages: List[discord.Embed] = []
 
-        # Build display lines using cached member objects
-        member_map = {m.id: m for m in staff_members_lb}
-        lines: List[str] = []
-        for pos, (uid, count) in enumerate(ranked, start=1):
-            medal    = medals[pos - 1] if pos <= 3 else f"`#{pos}`"
-            member   = member_map.get(uid) or (ctx.guild.get_member(uid) if ctx.guild else None)
-            name     = member.display_name if member else f"<@{uid}>"
-            rank     = self._member_rank(member) if member else None
-            rank_str = f" {RANK_EMOJIS.get(rank, '')} {rank}" if rank else ""
-            icon     = ACTION_ICONS.get(action, "📈") if action != "total" else "📈"
-            lines.append(
-                f"{medal} **{name}**{rank_str}\n"
-                f"  {icon} {action_label}: **{count}**"
+        # Always produce at least one page (even if empty)
+        for page_start in range(0, max(len(ranked), 1), PER_PAGE):
+            slice_ = ranked[page_start : page_start + PER_PAGE]
+            page_num   = page_start // PER_PAGE + 1
+            total_pages = max(1, (len(ranked) + PER_PAGE - 1) // PER_PAGE)
+
+            e = discord.Embed(
+                title=f"🏆  Staff Leaderboard — {scope_label}",
+                description=f"**Ranked by:** {action_label}",
+                color=0xF1C40F,
+                timestamp=now,
+            )
+            e.set_footer(
+                text=f"Scope: {scope_label}  ·  {action_label}  ·  Page {page_num}/{total_pages}",
+                icon_url=self.bot.user.display_avatar.url,
             )
 
-        if not lines:
-            embed.description = (
-                f"**Ranked by:** {action_label}\n\n"
-                "*No data recorded for this period yet.*"
-            )
-        else:
-            # Discord field limit is 1024 chars; split into chunks if needed
-            chunk: List[str] = []
-            chunk_len = 0
-            field_num = 1
-            for line in lines:
-                if chunk_len + len(line) + 1 > 1000 and chunk:
-                    embed.add_field(
-                        name=f"Rankings {'(cont.)' if field_num > 1 else ''}",
-                        value="\n".join(chunk),
-                        inline=False,
+            if not slice_:
+                e.description = f"**Ranked by:** {action_label}\n\n*No data recorded for this period yet.*"
+            else:
+                lines: List[str] = []
+                for pos, (uid, cnt) in enumerate(slice_, start=page_start + 1):
+                    medal    = medals[pos - 1] if pos <= 3 else f"`#{pos}`"
+                    m        = member_map.get(uid) or (ctx.guild.get_member(uid) if ctx.guild else None)
+                    name     = m.display_name if m else f"<@{uid}>"
+                    m_rank   = self._member_rank(m) if m else None
+                    rank_str = f" {RANK_EMOJIS.get(m_rank, '')} {m_rank}" if m_rank else ""
+                    lines.append(
+                        f"{medal} **{name}**{rank_str}\n"
+                        f"  {act_icon} {action_label}: **{cnt}**"
                     )
-                    chunk = []
-                    chunk_len = 0
-                    field_num += 1
-                chunk.append(line)
-                chunk_len += len(line) + 1
-            if chunk:
-                embed.add_field(
-                    name=f"Rankings {'(cont.)' if field_num > 1 else ''}",
-                    value="\n".join(chunk),
-                    inline=False,
-                )
+                e.add_field(name="Rankings", value="\n".join(lines), inline=False)
 
-        embed.set_footer(
-            text=f"Scope: {scope_label}  ·  Filtered by: {action_label}",
-            icon_url=self.bot.user.display_avatar.url,
-        )
-        await ctx.send(embed=embed)
+            lb_pages.append(e)
+
+        view = PageView(lb_pages)
+        await ctx.send(embed=lb_pages[0], view=view)
 
 
 # ---------------------------------------------------------------------------
