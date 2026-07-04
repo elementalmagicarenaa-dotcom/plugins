@@ -83,7 +83,6 @@ ACTION_COLORS: Dict[str, int] = {
     "kick":         0xE74C3C,
     "ban":          0x992D22,
     "softban":      0xC0392B,
-    "note":         0x95A5A6,
     "ticket_close": 0x1ABC9C,
 }
 
@@ -93,7 +92,6 @@ ACTION_ICONS: Dict[str, str] = {
     "kick":         "👟",
     "ban":          "🔨",
     "softban":      "🪃",
-    "note":         "📝",
     "ticket_close": "🎫",
 }
 
@@ -127,10 +125,6 @@ DYNO_TITLE_MAP: Dict[str, str] = {
     "user softbanned":   "softban",
     "softbanned":        "softban",
     "softban":           "softban",
-    # --- note ---
-    "note added":        "note",
-    "noted":             "note",
-    "note":              "note",
     # --- reverse actions (decrement stats) ---
     "member unbanned":      "unban",
     "user unbanned":        "unban",
@@ -170,7 +164,6 @@ REVERSE_ACTION_MAP: Dict[str, str] = {
     "delkick":    "kick",
     "delban":     "ban",
     "delsoftban": "softban",
-    "delnote":    "note",
 }
 
 # Frozenset of all reversal-action keys — used for priority matching in the parser.
@@ -202,7 +195,6 @@ ACTION_LABELS: Dict[str, str] = {
     "kick":         "Kicks",
     "ban":          "Bans",
     "softban":      "Softbans",
-    "note":         "Notes",
     "ticket_close": "Tickets Closed",
 }
 
@@ -352,7 +344,6 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
             "ban":     "delban",
             "mute":    "delmute",
             "kick":    "delkick",
-            "note":    "delnote",
             "warn":    "delwarn",
             "warning": "delwarn",
         }
