@@ -495,138 +495,6 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
 # Button Views — using add_item for Python 3.8+ compatibility
 # ---------------------------------------------------------------------------
 
-class AttachEvidenceModal(ui.Modal, title="📎  Attach Evidence"):
-    """Modal that lets staff attach an evidence link to a mod action log embed."""
-
-    url = ui.TextInput(
-        label="Evidence URL",
-        placeholder="https://discord.com/channels/... or any direct link",
-        required=True,
-        max_length=500,
-        style=discord.TextStyle.short,
-    )
-    note = ui.TextInput(
-        label="Label / Note  (optional)",
-        placeholder='e.g. "Screenshot", "Prior history", "Context"',
-        required=False,
-        max_length=100,
-        style=discord.TextStyle.short,
-    )
-
-    def __init__(self, original_message: discord.Message) -> None:
-        super().__init__()
-        self.original_message = original_message
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        raw_url  = self.url.value.strip()
-        raw_note = (self.note.value or "").strip()
-
-        # Basic URL sanity check
-        if not (raw_url.startswith("http://") or raw_url.startswith("https://")):
-            await interaction.response.send_message(
-                "❌ That doesn't look like a valid URL. Please include `https://`.",
-                ephemeral=True,
-            )
-            return
-
-        msg = self.original_message
-        if not msg or not msg.embeds:
-            await interaction.response.send_message(
-                "❌ Couldn't find the original embed to edit.", ephemeral=True
-            )
-            return
-
-        embed = msg.embeds[0].copy()
-
-        # ── Create or reuse a thread on the log message ──────────────────
-        thread: Optional[discord.Thread] = None
-
-        # Check if a thread already exists on this message
-        if isinstance(msg.channel, discord.TextChannel):
-            existing_thread = msg.thread  # non-None if already has a thread
-            if existing_thread:
-                thread = existing_thread
-            else:
-                # Derive a short name from the embed title
-                embed_title = embed.title or "Mod Log"
-                # strip the icon prefix (e.g. "⚠️  Moderation Action — Warn" → "Evidence — Warn")
-                action_part = embed_title.split("—")[-1].strip() if "—" in embed_title else embed_title
-                thread_name = f"Evidence — {action_part}"[:100]
-                try:
-                    thread = await msg.create_thread(
-                        name=thread_name,
-                        auto_archive_duration=10080,  # 7 days
-                    )
-                except (discord.Forbidden, discord.HTTPException):
-                    thread = None  # silently continue without a thread
-
-        # ── Post evidence into the thread ─────────────────────────────────
-        if thread:
-            submitter = interaction.user
-            note_part = f"**{discord.utils.escape_markdown(raw_note)}**\n" if raw_note else ""
-            await thread.send(
-                f"📎 Evidence attached by {submitter.mention}\n"
-                f"{note_part}{raw_url}"
-            )
-
-        # ── Update the embed with a link to the thread ────────────────────
-        thread_ref = f" · [View thread](<https://discord.com/channels/{msg.guild.id}/{thread.id}>)" if thread else ""
-        line = f"[{discord.utils.escape_markdown(raw_note)}]({raw_url})" if raw_note else raw_url
-
-        evidence_idx = next(
-            (i for i, f in enumerate(embed.fields) if "evidence" in (f.name or "").lower()),
-            None,
-        )
-        field_name = f"🔍  Evidence{thread_ref}" if thread else "🔍  Evidence"
-        if evidence_idx is not None:
-            existing = embed.fields[evidence_idx].value or ""
-            embed.set_field_at(
-                evidence_idx,
-                name=embed.fields[evidence_idx].name,
-                value=f"{existing}\n{line}",
-                inline=False,
-            )
-        else:
-            embed.add_field(name=field_name, value=line, inline=False)
-
-        await msg.edit(embed=embed)
-        await interaction.response.send_message(
-            f"✅ Evidence attached{' and posted in the thread' if thread else ''}!",
-            ephemeral=True,
-        )
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        await interaction.response.send_message(
-            "❌ Something went wrong attaching evidence. Please try again.",
-            ephemeral=True,
-        )
-
-
-class ModLogView(ui.View):
-    """
-    Persistent view attached to every mod action log embed.
-    Uses a fixed custom_id so it survives bot restarts.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(timeout=None)
-        btn = ui.Button(
-            label="📎  Attach Evidence",
-            style=discord.ButtonStyle.secondary,
-            custom_id="staffmgr:modlog_attach_evidence",
-        )
-        btn.callback = self._on_attach
-        self.add_item(btn)
-
-    async def _on_attach(self, interaction: discord.Interaction) -> None:
-        if interaction.message is None:
-            await interaction.response.send_message(
-                "❌ Could not resolve the log message.", ephemeral=True
-            )
-            return
-        modal = AttachEvidenceModal(original_message=interaction.message)
-        await interaction.response.send_modal(modal)
-
 
 class InactivityView(ui.View):
     """Accept / Decline buttons for a Leave of Absence request."""
@@ -762,8 +630,6 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     async def cog_load(self) -> None:
         self.weekly_report_task.start()
         self.check_loa_expiry.start()
-        # Register persistent view so the Attach Evidence button survives restarts
-        self.bot.add_view(ModLogView())
         # Initialize role tracking for existing staff after the bot is ready
         asyncio.create_task(self._init_role_tracking())
 
@@ -1255,7 +1121,17 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             ),
             icon_url=self.bot.user.display_avatar.url,
         )
-        log_msg = await log_ch.send(embed=embed, view=ModLogView())
+        log_msg = await log_ch.send(embed=embed)
+
+        # Open a thread on the log message so staff can drop screenshots/links directly
+        try:
+            action_part = (embed.title or "").split("—")[-1].strip() or label
+            await log_msg.create_thread(
+                name=f"Evidence — {action_part}"[:100],
+                auto_archive_duration=10080,  # 7 days
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # threads not supported or bot lacks permission — carry on
 
         # Record the action against the moderator's stat counter, storing the log link as evidence
         record_id = mod_id or (resolved_member.id if resolved_member else None)
