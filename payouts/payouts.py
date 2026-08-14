@@ -128,6 +128,13 @@ class PayoutOpenView(discord.ui.View):
             )
             return
 
+        submission_block = await self.plugin.payout_submission_block_reason(
+            interaction.user.id
+        )
+        if submission_block is not None:
+            await interaction.response.send_message(submission_block, ephemeral=True)
+            return
+
         await interaction.response.send_modal(PayoutDetailsModal(self.plugin))
 
 
@@ -198,7 +205,42 @@ class PayoutReviewView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button[PayoutReviewView],
     ) -> None:
-        await self.plugin.handle_review_decision(interaction, approved=False)
+        application_id = _application_id_from_message(interaction.message)
+        if application_id is None:
+            await interaction.response.send_message(
+                "This review message is missing its application ID.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            PayoutDenialModal(self.plugin, application_id)
+        )
+
+
+class PayoutDenialModal(discord.ui.Modal, title="Deny payout"):
+    """Collect the reason shown to an applicant when a payout is denied."""
+
+    reason = discord.ui.TextInput(
+        label="Reason for denial",
+        placeholder="Explain why this payout request was denied",
+        max_length=1000,
+        required=True,
+        style=discord.TextStyle.paragraph,
+    )
+
+    def __init__(self, plugin: "Payouts", application_id: str) -> None:
+        super().__init__()
+        self.plugin = plugin
+        self.application_id = application_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.plugin.handle_review_decision(
+            interaction,
+            approved=False,
+            application_id=self.application_id,
+            denial_reason=str(self.reason.value).strip(),
+        )
 
 
 class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
@@ -228,6 +270,12 @@ class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
         max_length=150,
         required=True,
     )
+    requested_amount = discord.ui.TextInput(
+        label="Requested payout amount",
+        placeholder="Example: $50 or 50 Robux",
+        max_length=50,
+        required=True,
+    )
 
     def __init__(self, plugin: "Payouts") -> None:
         super().__init__()
@@ -241,6 +289,7 @@ class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
                 "discord_username": str(self.discord_username.value).strip(),
                 "discord_id": str(self.discord_id.value).strip(),
                 "current_rank": str(self.current_rank.value).strip(),
+                "requested_amount": str(self.requested_amount.value).strip(),
             },
         )
 
@@ -435,7 +484,8 @@ class Payouts(commands.Cog):
             f"({application.get('roblox_username', 'Unknown Roblox user')})\n"
             f"Discord: <@{application.get('applicant_id', application.get('discord_id', '0'))}> "
             f"(`{application.get('discord_id', 'unknown')}`)\n"
-            f"Rank: {application.get('current_rank', 'Unknown')}"
+            f"Rank: {application.get('current_rank', 'Unknown')}\n"
+            f"Requested amount: {application.get('requested_amount', 'Not provided')}"
             for index, application in enumerate(applications, start=1)
         ]
 
@@ -452,6 +502,30 @@ class Payouts(commands.Cog):
 
         for chunk in chunks:
             await ctx.send(chunk)
+
+    async def payout_submission_block_reason(self, user_id: int) -> str | None:
+        """Return a user-facing reason when an applicant can no longer submit."""
+
+        applications = [
+            application
+            async for application in self.db.find({"applicant_id": str(user_id)})
+        ]
+        if any(application.get("status") == "approved" for application in applications):
+            return (
+                "Your staff payout application has already been approved. "
+                "You cannot submit another payout request."
+            )
+
+        denied_count = sum(
+            application.get("status") == "denied"
+            for application in applications
+        )
+        if denied_count >= 2:
+            return (
+                "You have used both staff payout application attempts. "
+                "You cannot submit another payout request."
+            )
+        return None
 
     async def has_active_application(self, user_id: int) -> bool:
         for status in ("awaiting_amount", "pending"):
@@ -487,6 +561,11 @@ class Payouts(commands.Cog):
             )
             return
 
+        submission_block = await self.payout_submission_block_reason(interaction.user.id)
+        if submission_block is not None:
+            await interaction.followup.send(submission_block, ephemeral=True)
+            return
+
         application_id = _new_application_id()
         application: dict[str, Any] = {
             "_id": application_id,
@@ -494,6 +573,7 @@ class Payouts(commands.Cog):
             "applicant_tag": str(interaction.user),
             "status": "pending",
             "amount_moderated": None,
+            "denial_reason": None,
             **details,
         }
 
@@ -590,6 +670,11 @@ class Payouts(commands.Cog):
             value=application["current_rank"],
             inline=False,
         )
+        embed.add_field(
+            name="Requested Payout Amount",
+            value=application.get("requested_amount", "Not provided"),
+            inline=False,
+        )
         if application.get("amount_moderated") is not None:
             embed.add_field(
                 name="Amount of people moderated",
@@ -623,6 +708,8 @@ class Payouts(commands.Cog):
         interaction: discord.Interaction,
         *,
         approved: bool,
+        application_id: str | None = None,
+        denial_reason: str | None = None,
     ) -> None:
         if interaction.user.id not in CONFIG.reviewer_user_ids:
             await interaction.response.send_message(
@@ -631,7 +718,7 @@ class Payouts(commands.Cog):
             )
             return
 
-        application_id = _application_id_from_message(interaction.message)
+        application_id = application_id or _application_id_from_message(interaction.message)
         if application_id is None:
             await interaction.response.send_message(
                 "This review message is missing its application ID.",
@@ -662,6 +749,7 @@ class Payouts(commands.Cog):
                     "status": status,
                     "reviewer_id": str(interaction.user.id),
                     "reviewed_at": discord.utils.utcnow().isoformat(),
+                    "denial_reason": denial_reason if not approved else None,
                 }
             },
         )
@@ -686,6 +774,7 @@ class Payouts(commands.Cog):
             else:
                 message = (
                     "Your staff payout application has been denied. "
+                    f"Reason: {denial_reason or 'No reason was provided.'} "
                     f"If there is a problem, DM {CONFIG.head_administrator_name}, "
                     "Head Administrator."
                 )
@@ -703,6 +792,12 @@ class Payouts(commands.Cog):
             f"Decision by {interaction.user}."
             + ("" if applicant_dm_sent else " The applicant could not be DM'd.")
         )
+        if not approved:
+            decision_embed.add_field(
+                name="Denial Reason",
+                value=denial_reason or "No reason was provided.",
+                inline=False,
+            )
         decision_embed.color = discord.Color.green() if approved else discord.Color.red()
         await interaction.message.edit(
             embed=decision_embed,
