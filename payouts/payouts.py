@@ -410,6 +410,49 @@ class Payouts(commands.Cog):
             f"Staff payouts are now closed. Sent {sent} closing DM(s) to eligible members."
         )
 
+    @checks.has_permissions(PermissionLevel.OWNER)
+    @commands.command(name="payoutapproved")
+    async def payout_approved_command(self, ctx: commands.Context[Any]) -> None:
+        """Display every staff member whose payout application was approved."""
+
+        applications = [
+            application
+            async for application in self.db.find({"status": "approved"})
+        ]
+        applications.sort(
+            key=lambda application: (
+                str(application.get("discord_username", "")).casefold(),
+                str(application.get("_id", "")),
+            )
+        )
+
+        if not applications:
+            await ctx.send("No staff payout applications have been approved yet.")
+            return
+
+        lines = [
+            f"**{index}. {application.get('discord_username', 'Unknown Discord user')}** "
+            f"({application.get('roblox_username', 'Unknown Roblox user')})\n"
+            f"Discord: <@{application.get('applicant_id', application.get('discord_id', '0'))}> "
+            f"(`{application.get('discord_id', 'unknown')}`)\n"
+            f"Rank: {application.get('current_rank', 'Unknown')}"
+            for index, application in enumerate(applications, start=1)
+        ]
+
+        header = f"**Approved staff payouts ({len(applications)})**"
+        chunks: list[str] = []
+        current = header
+        for line in lines:
+            if len(current) + len(line) + 2 > 1900:
+                chunks.append(current)
+                current = line
+            else:
+                current = f"{current}\n\n{line}"
+        chunks.append(current)
+
+        for chunk in chunks:
+            await ctx.send(chunk)
+
     async def has_active_application(self, user_id: int) -> bool:
         for status in ("awaiting_amount", "pending"):
             if await self.db.find_one(
