@@ -272,7 +272,7 @@ class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
     )
     requested_amount = discord.ui.TextInput(
         label="Requested payout amount",
-        placeholder="Example: $50 or 50 Robux",
+        placeholder="Example: 50 Souls and 100 Diamonds",
         max_length=50,
         required=True,
     )
