@@ -56,13 +56,14 @@ class PayoutConfig:
 CONFIG = PayoutConfig(
     guild_id=None,  # Example: 123456789012345678
     target_role_ids=(
-        # 123456789012345678,
-        # 234567890123456789,
+         1484613327442284795,
+         1457039931351367872,
+         1490692440146051092,
     ),
     reviewer_user_ids=(
-        # 345678901234567890,
+         1272561419061297184,
     ),
-    head_administrator_name="im_azv",
+    head_administrator_name="Azv",
 )
 
 
