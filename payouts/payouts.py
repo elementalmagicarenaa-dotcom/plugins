@@ -322,12 +322,21 @@ class Payouts(commands.Cog):
         self.bot = bot
         self.db = self.bot.plugin_db.get_partition(self)
         self.payouts_open = False
+        self.payout_cycle_id: str | None = None
 
     async def cog_load(self) -> None:
         """Restore the open/closed state when Modmail loads the plugin."""
 
         state = await self.db.find_one({"_id": "state"})
         self.payouts_open = bool(state and state.get("payouts_open", False))
+        self.payout_cycle_id = state.get("payout_cycle_id") if state else None
+        if self.payouts_open and self.payout_cycle_id is None:
+            self.payout_cycle_id = _new_application_id()
+            await self.db.find_one_and_update(
+                {"_id": "state"},
+                {"$set": {"payout_cycle_id": self.payout_cycle_id}},
+                upsert=True,
+            )
 
     def _configuration_errors(self) -> list[str]:
         errors: list[str] = []
@@ -338,10 +347,18 @@ class Payouts(commands.Cog):
         return errors
 
     async def _set_payout_state(self, is_open: bool) -> None:
+        if is_open and not self.payouts_open:
+            self.payout_cycle_id = _new_application_id()
+
         self.payouts_open = is_open
         await self.db.find_one_and_update(
             {"_id": "state"},
-            {"$set": {"payouts_open": is_open}},
+            {
+                "$set": {
+                    "payouts_open": is_open,
+                    "payout_cycle_id": self.payout_cycle_id,
+                }
+            },
             upsert=True,
         )
 
@@ -504,26 +521,21 @@ class Payouts(commands.Cog):
             await ctx.send(chunk)
 
     async def payout_submission_block_reason(self, user_id: int) -> str | None:
-        """Return a user-facing reason when an applicant can no longer submit."""
+        """Return a user-facing reason when an applicant already submitted this cycle."""
 
         applications = [
             application
-            async for application in self.db.find({"applicant_id": str(user_id)})
-        ]
-        if any(application.get("status") == "approved" for application in applications):
-            return (
-                "Your staff payout application has already been approved. "
-                "You cannot submit another payout request."
+            async for application in self.db.find(
+                {
+                    "applicant_id": str(user_id),
+                    "payout_cycle_id": self.payout_cycle_id,
+                }
             )
-
-        denied_count = sum(
-            application.get("status") == "denied"
-            for application in applications
-        )
-        if denied_count >= 2:
+        ]
+        if applications:
             return (
-                "You have used both staff payout application attempts. "
-                "You cannot submit another payout request."
+                "You have already submitted a payout request for this payout cycle. "
+                "You can submit another request when the next payout cycle opens."
             )
         return None
 
@@ -574,6 +586,7 @@ class Payouts(commands.Cog):
             "status": "pending",
             "amount_moderated": None,
             "denial_reason": None,
+            "payout_cycle_id": self.payout_cycle_id,
             **details,
         }
 
