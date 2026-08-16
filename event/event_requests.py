@@ -41,12 +41,12 @@ class EventRequestConfig:
 # ---------------------------------------------------------------------------
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
-    event_host_role_id=None,  # Replace with the Event Host role ID
+    event_host_role_id=1463522255785955429,  # Replace with the Event Host role ID
     reviewer_user_ids=(
-        1272561419061297184,  # Azv
+        1268583625868447927,  # Azv
         # Humanity's Discord user ID,
     ),
-    approved_events_channel_id=None,  # Example: 123456789012345678
+    approved_events_channel_id=1538583496988299304,
 )
 
 
