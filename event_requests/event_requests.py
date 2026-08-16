@@ -43,7 +43,7 @@ class EventRequestConfig:
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Replace with the Event Host role ID
     reviewer_user_ids=(
-        1268583625868447927,  # Azv
+        1272561419061297184,  # Azv
         1268583625868447927,
     ),
     approved_events_channel_id=1538583496988299304,
