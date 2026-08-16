@@ -46,7 +46,7 @@ CONFIG = EventRequestConfig(
        1268583625868447927 ,  # Azv
         # Humanity's Discord user ID,
     ),
-    approved_events_channel_id=None,  # Example: 123456789012345678
+    approved_events_channel_id=1538583496988299304 ,
 )
 
 
