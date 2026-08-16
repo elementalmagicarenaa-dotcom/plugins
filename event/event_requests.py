@@ -43,10 +43,10 @@ class EventRequestConfig:
 CONFIG = EventRequestConfig(
     event_host_role_id=None,  # Replace with the Event Host role ID
     reviewer_user_ids=(
-       1268583625868447927 ,  # Azv
-       1268583625868447927 ,
+        1272561419061297184,  # Azv
+        # Humanity's Discord user ID,
     ),
-    approved_events_channel_id=1538583496988299304 ,
+    approved_events_channel_id=None,  # Example: 123456789012345678
 )
 
 
@@ -252,7 +252,7 @@ class EventRequests(commands.Cog):
         errors: list[str] = []
         if CONFIG.event_host_role_id is None:
             errors.append("set the Event Host role ID")
-        if len(CONFIG.reviewer_user_ids) < 2:
+        if len(set(CONFIG.reviewer_user_ids)) < 2:
             errors.append("set both the Azv and Humanity Discord user IDs")
         if CONFIG.approved_events_channel_id is None:
             errors.append("set the approved events channel ID")
