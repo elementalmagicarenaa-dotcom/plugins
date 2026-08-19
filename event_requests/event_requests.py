@@ -41,16 +41,20 @@ class EventRequestConfig:
 # ---------------------------------------------------------------------------
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
-    event_host_role_id=1463522255785955429,  # Replace with the Event Host role ID
+    event_host_role_id=None,  # Replace with the Event Host role ID
     reviewer_user_ids=(
         1272561419061297184,  # Azv
-        1268256310621638811,
+        # Humanity's Discord user ID,
     ),
-    approved_events_channel_id=1538583496988299304,
+    approved_events_channel_id=None,  # Example: 123456789012345678
 )
 
 
 OPEN_FORM_CUSTOM_ID = "event-requests:open-form"
+RESUME_DRAFT_CUSTOM_ID = "event-requests:resume-draft"
+SAVE_DRAFT_CUSTOM_ID = "event-requests:save-draft"
+EDIT_DRAFT_CUSTOM_ID = "event-requests:edit-draft"
+SUBMIT_DRAFT_CUSTOM_ID = "event-requests:submit-draft"
 APPROVE_CUSTOM_ID = "event-requests:approve"
 DENY_CUSTOM_ID = "event-requests:deny"
 
@@ -105,8 +109,42 @@ class EventRequestOpenView(discord.ui.View):
             )
             return
 
+        if await self.plugin.find_draft(interaction.user.id) is not None:
+            await interaction.response.send_message(
+                "You already have a saved draft. Use the Resume Saved Draft button "
+                "to continue it.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.send_modal(EventRequestForm(self.plugin))
 
+    @discord.ui.button(
+        label="Resume saved draft",
+        style=discord.ButtonStyle.secondary,
+        custom_id=RESUME_DRAFT_CUSTOM_ID,
+    )
+    async def resume_draft(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[EventRequestOpenView],
+    ) -> None:
+        if not self.plugin.member_has_event_host_role(interaction.user):
+            await interaction.response.send_message(
+                "Only members with the Event Host role can submit event requests.",
+                ephemeral=True,
+            )
+            return
+
+        draft = await self.plugin.find_draft(interaction.user.id)
+        if draft is None:
+            await interaction.response.send_message(
+                "You do not have a saved event request draft.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(EventRequestForm(self.plugin, draft))
 
 class EventReviewView(discord.ui.View):
     """Persistent reviewer controls shared by every reviewer message."""
@@ -158,6 +196,87 @@ class EventReviewView(discord.ui.View):
         )
 
 
+class EventDraftActionView(discord.ui.View):
+    """Actions shown after a form is saved as a draft."""
+
+    def __init__(self, plugin: "EventRequests", request_id: str) -> None:
+        super().__init__(timeout=None)
+        self.plugin = plugin
+        self.request_id = request_id
+
+    @discord.ui.button(
+        label="Save Draft",
+        style=discord.ButtonStyle.secondary,
+        custom_id=SAVE_DRAFT_CUSTOM_ID,
+    )
+    async def save_draft(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[EventDraftActionView],
+    ) -> None:
+        draft = await self.plugin.db.find_one(
+            {
+                "_id": self.request_id,
+                "requester_id": str(interaction.user.id),
+                "status": "draft",
+            }
+        )
+        if draft is None:
+            await interaction.response.send_message(
+                "This draft has already been submitted or is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await self.plugin.db.find_one_and_update(
+            {"_id": self.request_id, "status": "draft"},
+            {"$set": {"updated_at": discord.utils.utcnow().isoformat()}},
+        )
+        await interaction.response.send_message(
+            "Your event request draft is saved. You can resume it from the "
+            "Resume Saved Draft button.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Edit Draft",
+        style=discord.ButtonStyle.primary,
+        custom_id=EDIT_DRAFT_CUSTOM_ID,
+    )
+    async def edit_draft(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[EventDraftActionView],
+    ) -> None:
+        draft = await self.plugin.db.find_one(
+            {
+                "_id": self.request_id,
+                "requester_id": str(interaction.user.id),
+                "status": "draft",
+            }
+        )
+        if draft is None:
+            await interaction.response.send_message(
+                "This draft has already been submitted or is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(EventRequestForm(self.plugin, draft))
+
+    @discord.ui.button(
+        label="Submit for Review",
+        style=discord.ButtonStyle.success,
+        custom_id=SUBMIT_DRAFT_CUSTOM_ID,
+    )
+    async def submit_draft(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[EventDraftActionView],
+    ) -> None:
+        await self.plugin.submit_draft(interaction, self.request_id)
+
+
 class EventRequestForm(discord.ui.Modal, title="Event request"):
     """The event details submitted by a host."""
 
@@ -165,26 +284,26 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
         label="Type of event",
         placeholder="Session, Game Event, Quiz, or another event type",
         max_length=100,
-        required=True,
+        required=False,
     )
     prizes = discord.ui.TextInput(
         label="Prizes",
         placeholder="1st Place: ... | 2nd Place: ... | 3rd Place: ...",
         max_length=500,
-        required=True,
+        required=False,
     )
     description = discord.ui.TextInput(
         label="Event description",
         placeholder="Explain what the event is and how participants will take part",
         max_length=1500,
-        required=True,
+        required=False,
         style=discord.TextStyle.paragraph,
     )
     proposed_time = discord.ui.TextInput(
         label="Preferred date/time and timezone",
         placeholder="Example: 24 Aug 2026, 8:00 PM MYT (UTC+8)",
         max_length=200,
-        required=True,
+        required=False,
     )
     additional_details = discord.ui.TextInput(
         label="Additional event details",
@@ -194,9 +313,22 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
         style=discord.TextStyle.paragraph,
     )
 
-    def __init__(self, plugin: "EventRequests") -> None:
+    def __init__(
+        self,
+        plugin: "EventRequests",
+        draft: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.plugin = plugin
+        self.draft_id = draft.get("_id") if draft else None
+        if draft is not None:
+            self.event_type.default = str(draft.get("event_type", ""))
+            self.prizes.default = str(draft.get("prizes", ""))
+            self.description.default = str(draft.get("description", ""))
+            self.proposed_time.default = str(draft.get("proposed_time", ""))
+            self.additional_details.default = str(
+                draft.get("additional_details", "")
+            )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await self.plugin.receive_request(
@@ -208,6 +340,7 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
                 "proposed_time": str(self.proposed_time.value).strip(),
                 "additional_details": str(self.additional_details.value).strip(),
             },
+            draft_id=self.draft_id,
         )
 
 
@@ -325,9 +458,19 @@ class EventRequests(commands.Cog):
             color=discord.Colour.green(),
         )
 
+    async def find_draft(self, user_id: int) -> dict[str, Any] | None:
+        """Find the user's current saved event request draft."""
+
+        return await self.db.find_one(
+            {
+                "requester_id": str(user_id),
+                "status": "draft",
+            }
+        )
+
     @commands.command(name="eventrequest")
     async def event_request_command(self, ctx: commands.Context[Any]) -> None:
-        """Show the button that opens the event request form."""
+        """Show the buttons that open or resume an event request form."""
 
         errors = self._configuration_errors()
         if errors:
@@ -356,6 +499,7 @@ class EventRequests(commands.Cog):
         self,
         interaction: discord.Interaction,
         details: dict[str, str],
+        draft_id: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -374,27 +518,118 @@ class EventRequests(commands.Cog):
             )
             return
 
-        request: dict[str, Any] = {
-            "_id": _new_request_id(),
-            "requester_id": str(interaction.user.id),
-            "requester_tag": str(interaction.user),
-            "status": "pending",
-            "decision_by": None,
-            "decision_by_tag": None,
-            "decision_reason": None,
-            "reviewed_at": None,
-            "review_message_ids": {},
-            **details,
-        }
-        await self.db.insert_one(request)
+        if draft_id is not None:
+            request = await self.db.find_one(
+                {
+                    "_id": draft_id,
+                    "requester_id": str(interaction.user.id),
+                    "status": "draft",
+                }
+            )
+            if request is None:
+                await interaction.followup.send(
+                    "That saved draft is no longer available.",
+                    ephemeral=True,
+                )
+                return
 
+            await self.db.find_one_and_update(
+                {"_id": draft_id, "status": "draft"},
+                {
+                    "$set": {
+                        **details,
+                        "updated_at": discord.utils.utcnow().isoformat(),
+                    }
+                },
+            )
+            request.update(details)
+        else:
+            request = {
+                "_id": _new_request_id(),
+                "requester_id": str(interaction.user.id),
+                "requester_tag": str(interaction.user),
+                "status": "draft",
+                "decision_by": None,
+                "decision_by_tag": None,
+                "decision_reason": None,
+                "reviewed_at": None,
+                "review_message_ids": {},
+                "created_at": discord.utils.utcnow().isoformat(),
+                "updated_at": discord.utils.utcnow().isoformat(),
+                **details,
+            }
+            await self.db.insert_one(request)
+
+        await interaction.followup.send(
+            "Your event request draft is saved. Choose Save Draft to keep it, "
+            "Edit Draft to make changes, or Submit for Review when it is ready.",
+            view=EventDraftActionView(self, request["_id"]),
+            ephemeral=True,
+        )
+
+    async def submit_draft(
+        self,
+        interaction: discord.Interaction,
+        request_id: str,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not self.member_has_event_host_role(interaction.user):
+            await interaction.followup.send(
+                "Only members with the Event Host role can submit event requests.",
+                ephemeral=True,
+            )
+            return
+
+        request = await self.db.find_one(
+            {
+                "_id": request_id,
+                "requester_id": str(interaction.user.id),
+                "status": "draft",
+            }
+        )
+        if request is None:
+            await interaction.followup.send(
+                "This draft has already been submitted or is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        required_fields = {
+            "event type": request.get("event_type"),
+            "prizes": request.get("prizes"),
+            "event description": request.get("description"),
+            "preferred date/time and timezone": request.get("proposed_time"),
+        }
+        missing_fields = [
+            label for label, value in required_fields.items() if not str(value or "").strip()
+        ]
+        if missing_fields:
+            await interaction.followup.send(
+                "Please complete these fields before submitting: "
+                + ", ".join(missing_fields)
+                + ". Use Edit Draft to continue.",
+                ephemeral=True,
+            )
+            return
+
+        await self.db.find_one_and_update(
+            {"_id": request_id, "status": "draft"},
+            {
+                "$set": {
+                    "status": "pending",
+                    "submitted_at": discord.utils.utcnow().isoformat(),
+                }
+            },
+        )
+        request["status"] = "pending"
         reviewer_count = await self.notify_reviewers(request)
         await interaction.followup.send(
             (
                 "Your event request has been sent to Azv and Humanity for review."
                 if reviewer_count == len(CONFIG.reviewer_user_ids)
                 else (
-                    "Your event request was saved, but not every configured "
+                    "Your event request was submitted, but not every configured "
                     "reviewer could be notified."
                 )
             ),
