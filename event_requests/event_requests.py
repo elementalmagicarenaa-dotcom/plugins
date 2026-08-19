@@ -32,6 +32,9 @@ class EventRequestConfig:
     # Only members with this role can create event requests.
     event_host_role_id: int | None = None
 
+    # The channel where .eventrequestchannel posts the current form panel.
+    event_request_channel_id: int | None = None
+
     # Add Azv's and Humanity's Discord user IDs in this order.
     reviewer_user_ids: tuple[int, ...] = ()
 
@@ -45,11 +48,12 @@ class EventRequestConfig:
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Event Host role
+    event_request_channel_id=1538583496988299304,
     reviewer_user_ids=(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
     ),
-    approved_events_channel_id=1538583496988299304,
+    approved_events_channel_id=1538885219694944317,
 )
 
 
@@ -504,23 +508,47 @@ class EventRequests(commands.Cog):
         self,
         ctx: commands.Context[Any],
     ) -> None:
-        """Post an event request panel that remains available in this channel."""
+        """Post the newest event request panel in the configured channel."""
 
-        embed = discord.Embed(
-            title="Event Request Form",
-            description=(
-                "Event Hosts can use the buttons below to start or resume an "
-                "event request at any time. Include your timezone with the "
-                "preferred date and time."
-            ),
-            color=discord.Colour.blurple(),
-        )
-        await ctx.send(
-            content=f"<@&{CONFIG.event_host_role_id}>",
-            embed=embed,
-            view=EventRequestOpenView(self),
-            allowed_mentions=discord.AllowedMentions(roles=True),
-        )
+        channel_id = CONFIG.event_request_channel_id
+        if channel_id is None:
+            await ctx.send(
+                "The event request destination channel has not been configured."
+            )
+            return
+
+        try:
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                channel = await self.bot.fetch_channel(channel_id)
+
+            embed = discord.Embed(
+                title="Event Request Form",
+                description=(
+                    "Event Hosts can use the buttons below to start or resume an "
+                    "event request at any time. Include your timezone with the "
+                    "preferred date and time."
+                ),
+                color=discord.Colour.blurple(),
+            )
+            await channel.send(
+                content=(
+                    f"<@&{CONFIG.event_host_role_id}>\n"
+                    "This is the newest version of the form, please use this."
+                ),
+                embed=embed,
+                view=EventRequestOpenView(self),
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+            await ctx.send(f"Event request form sent to <#{channel_id}>.")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not send event request form to channel %s.",
+                channel_id,
+            )
+            await ctx.send(
+                "I could not send the event request form to the configured channel."
+            )
 
     async def receive_request(
         self,
