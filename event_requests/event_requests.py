@@ -18,6 +18,9 @@ from typing import Any
 import discord
 from discord.ext import commands
 
+from core import checks
+from core.checks import PermissionLevel
+
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +44,12 @@ class EventRequestConfig:
 # ---------------------------------------------------------------------------
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
-    event_host_role_id=1463522255785955429,  # Replace with the Event Host role ID
+    event_host_role_id=1463522255785955429,  # Event Host role
     reviewer_user_ids=(
         1272561419061297184,  # Azv
-        1268256310621638811,
+        1268256310621638811,  # Humanity
     ),
-    approved_events_channel_id=1538583496988299304
+    approved_events_channel_id=1538583496988299304,
 )
 
 
@@ -490,6 +493,25 @@ class EventRequests(commands.Cog):
             description=(
                 "Click the button below to submit an event request. "
                 "Include your timezone with the preferred date and time."
+            ),
+            color=discord.Colour.blurple(),
+        )
+        await ctx.send(embed=embed, view=EventRequestOpenView(self))
+
+    @checks.has_permissions(PermissionLevel.OWNER)
+    @commands.command(name="eventrequestchannel")
+    async def event_request_channel_command(
+        self,
+        ctx: commands.Context[Any],
+    ) -> None:
+        """Post an event request panel that remains available in this channel."""
+
+        embed = discord.Embed(
+            title="Event Request Form",
+            description=(
+                "Event Hosts can use the buttons below to start or resume an "
+                "event request at any time. Include your timezone with the "
+                "preferred date and time."
             ),
             color=discord.Colour.blurple(),
         )
