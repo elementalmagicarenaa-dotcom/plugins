@@ -32,6 +32,9 @@ class EventRequestConfig:
     # Only members with this role can create event requests.
     event_host_role_id: int | None = None
 
+    # Only these channels can receive the event request panel.
+    event_request_channel_ids: tuple[int, ...] = ()
+
     # Add Azv's and Humanity's Discord user IDs in this order.
     reviewer_user_ids: tuple[int, ...] = ()
 
@@ -45,6 +48,9 @@ class EventRequestConfig:
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Event Host role
+    event_request_channel_ids=(
+        1538885219694944317,
+    ),
     reviewer_user_ids=(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
@@ -505,6 +511,12 @@ class EventRequests(commands.Cog):
         ctx: commands.Context[Any],
     ) -> None:
         """Post an event request panel that remains available in this channel."""
+
+        if ctx.channel is None or ctx.channel.id not in CONFIG.event_request_channel_ids:
+            await ctx.send(
+                "This command can only be used in a configured event request channel."
+            )
+            return
 
         embed = discord.Embed(
             title="Event Request Form",
