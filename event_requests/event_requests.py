@@ -48,12 +48,12 @@ class EventRequestConfig:
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Event Host role
-    event_request_channel_id=1538885219694944317,  # Replace with the Event Request channel ID
+    event_request_channel_id=None,  # Replace with the Event Request channel ID
     reviewer_user_ids=(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
     ),
-    approved_events_channel_id=1538583496988299304,
+    approved_events_channel_id=1538885219694944317,
 )
 
 
@@ -64,6 +64,7 @@ PANEL_SUBMIT_DRAFT_CUSTOM_ID = "event-requests:panel-submit-draft"
 SAVE_DRAFT_CUSTOM_ID = "event-requests:save-draft"
 EDIT_DRAFT_CUSTOM_ID = "event-requests:edit-draft"
 SUBMIT_DRAFT_CUSTOM_ID = "event-requests:submit-draft"
+ADDITIONAL_DETAILS_CUSTOM_ID = "event-requests:additional-details"
 APPROVE_CUSTOM_ID = "event-requests:approve"
 DENY_CUSTOM_ID = "event-requests:deny"
 
@@ -120,8 +121,7 @@ class EventRequestOpenView(discord.ui.View):
 
         if await self.plugin.find_draft(interaction.user.id) is not None:
             await interaction.response.send_message(
-                "You already have a saved draft. Use the Resume Saved Draft button "
-                "to continue it.",
+                "You already have a saved draft. Use Edit Draft to continue it.",
                 ephemeral=True,
             )
             return
@@ -312,6 +312,34 @@ class EventDraftActionView(discord.ui.View):
     ) -> None:
         await self.plugin.submit_draft(interaction, self.request_id)
 
+    @discord.ui.button(
+        label="Additional Details",
+        style=discord.ButtonStyle.secondary,
+        custom_id=ADDITIONAL_DETAILS_CUSTOM_ID,
+    )
+    async def additional_details(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[EventDraftActionView],
+    ) -> None:
+        draft = await self.plugin.db.find_one(
+            {
+                "_id": self.request_id,
+                "requester_id": str(interaction.user.id),
+                "status": "draft",
+            }
+        )
+        if draft is None:
+            await interaction.response.send_message(
+                "This draft has already been submitted or is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            AdditionalDetailsForm(self.plugin, draft)
+        )
+
 
 class EventRequestForm(discord.ui.Modal, title="Event request"):
     """The event details submitted by a host."""
@@ -347,13 +375,6 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
         max_length=200,
         required=False,
     )
-    additional_details = discord.ui.TextInput(
-        label="Additional event details",
-        placeholder="Duration, participant limit, materials, rules, or other notes",
-        max_length=1000,
-        required=False,
-        style=discord.TextStyle.paragraph,
-    )
 
     def __init__(
         self,
@@ -369,9 +390,6 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
             self.co_host.default = str(draft.get("co_host", ""))
             self.description.default = str(draft.get("description", ""))
             self.proposed_time.default = str(draft.get("proposed_time", ""))
-            self.additional_details.default = str(
-                draft.get("additional_details", "")
-            )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await self.plugin.receive_request(
@@ -382,9 +400,51 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
                 "co_host": str(self.co_host.value).strip(),
                 "description": str(self.description.value).strip(),
                 "proposed_time": str(self.proposed_time.value).strip(),
-                "additional_details": str(self.additional_details.value).strip(),
             },
             draft_id=self.draft_id,
+        )
+
+
+class AdditionalDetailsForm(discord.ui.Modal, title="Additional event details"):
+    """Collect optional details in a second modal to stay within Discord's limit."""
+
+    details = discord.ui.TextInput(
+        label="Additional event details",
+        placeholder="Duration, participant limit, materials, rules, or other notes",
+        max_length=1000,
+        required=False,
+        style=discord.TextStyle.paragraph,
+    )
+
+    def __init__(
+        self,
+        plugin: "EventRequests",
+        draft: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.plugin = plugin
+        self.draft_id = str(draft["_id"])
+        self.details.default = str(draft.get("additional_details", ""))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self.plugin.db.find_one_and_update(
+            {
+                "_id": self.draft_id,
+                "requester_id": str(interaction.user.id),
+                "status": "draft",
+            },
+            {
+                "$set": {
+                    "additional_details": str(self.details.value).strip(),
+                    "updated_at": discord.utils.utcnow().isoformat(),
+                }
+            },
+        )
+        await interaction.followup.send(
+            "Additional event details saved. You can edit them again or "
+            "submit the draft from the event request panel.",
+            ephemeral=True,
         )
 
 
@@ -679,7 +739,9 @@ class EventRequests(commands.Cog):
 
         await interaction.followup.send(
             "Your event request draft is saved. Use Edit Draft to make changes, "
-            "or Submit Draft from the event request panel when it is ready.",
+            "use Additional Details for extra notes, or Submit Draft from the "
+            "event request panel when it is ready.",
+            view=EventDraftActionView(self, request["_id"]),
             ephemeral=True,
         )
 
