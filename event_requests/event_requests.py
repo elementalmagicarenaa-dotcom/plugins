@@ -48,7 +48,7 @@ class EventRequestConfig:
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Event Host role
-    event_request_channel_id=1538885219694944317,  # Replace with the Event Request channel ID
+    event_request_channel_id=None,  # Replace with the Event Request channel ID
     reviewer_user_ids=(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
@@ -328,6 +328,12 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
         max_length=500,
         required=False,
     )
+    co_host = discord.ui.TextInput(
+        label="Co-Host",
+        placeholder="Mention the co-host or write their Discord username",
+        max_length=200,
+        required=False,
+    )
     description = discord.ui.TextInput(
         label="Event description",
         placeholder="Explain what the event is and how participants will take part",
@@ -360,6 +366,7 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
         if draft is not None:
             self.event_type.default = str(draft.get("event_type", ""))
             self.prizes.default = str(draft.get("prizes", ""))
+            self.co_host.default = str(draft.get("co_host", ""))
             self.description.default = str(draft.get("description", ""))
             self.proposed_time.default = str(draft.get("proposed_time", ""))
             self.additional_details.default = str(
@@ -372,6 +379,7 @@ class EventRequestForm(discord.ui.Modal, title="Event request"):
             {
                 "event_type": str(self.event_type.value).strip(),
                 "prizes": str(self.prizes.value).strip(),
+                "co_host": str(self.co_host.value).strip(),
                 "description": str(self.description.value).strip(),
                 "proposed_time": str(self.proposed_time.value).strip(),
                 "additional_details": str(self.additional_details.value).strip(),
@@ -471,6 +479,11 @@ class EventRequests(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name="Co-Host",
+            value=_safe_text(request.get("co_host")),
+            inline=False,
+        )
+        embed.add_field(
             name="Description",
             value=_safe_text(request.get("description")),
             inline=False,
@@ -560,6 +573,26 @@ class EventRequests(commands.Cog):
                 ),
                 color=discord.Colour.blurple(),
             )
+
+            # Remove older copies of this panel so members do not use an
+            # outdated form message. Only delete panels posted by this bot;
+            # unrelated channel messages are left untouched.
+            bot_user = self.bot.user
+            if bot_user is not None:
+                async for message in channel.history(limit=100):
+                    if (
+                        message.author.id == bot_user.id
+                        and message.embeds
+                        and message.embeds[0].title == "Event Request Form"
+                    ):
+                        try:
+                            await message.delete()
+                        except (discord.Forbidden, discord.HTTPException):
+                            logger.warning(
+                                "Could not delete outdated event request panel %s.",
+                                message.id,
+                            )
+
             await channel.send(
                 content=(
                     f"<@&{CONFIG.event_host_role_id}>\n"
