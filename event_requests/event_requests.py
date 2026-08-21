@@ -48,7 +48,7 @@ class EventRequestConfig:
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Event Host role
-    event_request_channel_id=None,  # Replace with the Event Request channel ID
+    event_request_channel_id=1538885219694944317,  # Replace with the Event Request channel ID
     reviewer_user_ids=(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
