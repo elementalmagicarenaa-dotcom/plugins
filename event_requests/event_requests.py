@@ -33,7 +33,7 @@ class EventRequestConfig:
     event_host_role_id: int | None = None
 
     # The channel where .eventrequestchannel posts the current form panel.
-    event_request_channel_id: int | None = None
+    event_request_channel_id: int | None = None  # Event Request channel
 
     # Add Azv's and Humanity's Discord user IDs in this order.
     reviewer_user_ids: tuple[int, ...] = ()
@@ -48,17 +48,19 @@ class EventRequestConfig:
 # Replace the empty values below with the correct IDs before installing.
 CONFIG = EventRequestConfig(
     event_host_role_id=1463522255785955429,  # Event Host role
-    event_request_channel_id=1538885219694944317,
+    event_request_channel_id=1538885219694944317,  # Replace with the Event Request channel ID
     reviewer_user_ids=(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
     ),
-    approved_events_channel_id=1538583496988299304,
+    approved_events_channel_id=1538885219694944317,
 )
 
 
 OPEN_FORM_CUSTOM_ID = "event-requests:open-form"
 RESUME_DRAFT_CUSTOM_ID = "event-requests:resume-draft"
+PANEL_EDIT_DRAFT_CUSTOM_ID = "event-requests:panel-edit-draft"
+PANEL_SUBMIT_DRAFT_CUSTOM_ID = "event-requests:panel-submit-draft"
 SAVE_DRAFT_CUSTOM_ID = "event-requests:save-draft"
 EDIT_DRAFT_CUSTOM_ID = "event-requests:edit-draft"
 SUBMIT_DRAFT_CUSTOM_ID = "event-requests:submit-draft"
@@ -100,7 +102,7 @@ class EventRequestOpenView(discord.ui.View):
         self.plugin = plugin
 
     @discord.ui.button(
-        label="Fill out event request",
+        label="Open Draft",
         style=discord.ButtonStyle.primary,
         custom_id=OPEN_FORM_CUSTOM_ID,
     )
@@ -127,11 +129,11 @@ class EventRequestOpenView(discord.ui.View):
         await interaction.response.send_modal(EventRequestForm(self.plugin))
 
     @discord.ui.button(
-        label="Resume saved draft",
+        label="Edit Draft",
         style=discord.ButtonStyle.secondary,
-        custom_id=RESUME_DRAFT_CUSTOM_ID,
+        custom_id=PANEL_EDIT_DRAFT_CUSTOM_ID,
     )
-    async def resume_draft(
+    async def edit_draft(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button[EventRequestOpenView],
@@ -146,12 +148,39 @@ class EventRequestOpenView(discord.ui.View):
         draft = await self.plugin.find_draft(interaction.user.id)
         if draft is None:
             await interaction.response.send_message(
-                "You do not have a saved event request draft.",
+                "You do not have an event request draft yet. Use Open Draft first.",
                 ephemeral=True,
             )
             return
 
         await interaction.response.send_modal(EventRequestForm(self.plugin, draft))
+
+    @discord.ui.button(
+        label="Submit Draft",
+        style=discord.ButtonStyle.success,
+        custom_id=PANEL_SUBMIT_DRAFT_CUSTOM_ID,
+    )
+    async def submit_draft(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[EventRequestOpenView],
+    ) -> None:
+        if not self.plugin.member_has_event_host_role(interaction.user):
+            await interaction.response.send_message(
+                "Only members with the Event Host role can submit event requests.",
+                ephemeral=True,
+            )
+            return
+
+        draft = await self.plugin.find_draft(interaction.user.id)
+        if draft is None:
+            await interaction.response.send_message(
+                "You do not have an event request draft yet. Use Open Draft first.",
+                ephemeral=True,
+            )
+            return
+
+        await self.plugin.submit_draft(interaction, draft["_id"])
 
 class EventReviewView(discord.ui.View):
     """Persistent reviewer controls shared by every reviewer message."""
@@ -616,9 +645,8 @@ class EventRequests(commands.Cog):
             await self.db.insert_one(request)
 
         await interaction.followup.send(
-            "Your event request draft is saved. Choose Save Draft to keep it, "
-            "Edit Draft to make changes, or Submit for Review when it is ready.",
-            view=EventDraftActionView(self, request["_id"]),
+            "Your event request draft is saved. Use Edit Draft to make changes, "
+            "or Submit Draft from the event request panel when it is ready.",
             ephemeral=True,
         )
 
