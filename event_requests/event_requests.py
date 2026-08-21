@@ -53,7 +53,7 @@ CONFIG = EventRequestConfig(
         1272561419061297184,  # Azv
         1268256310621638811,  # Humanity
     ),
-    approved_events_channel_id=1538885219694944317,
+    approved_events_channel_id=1538583496988299304,
 )
 
 
