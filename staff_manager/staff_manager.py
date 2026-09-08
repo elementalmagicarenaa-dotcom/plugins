@@ -2197,8 +2197,9 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         week_offset: int = 0,
     ) -> None:
         """
-        Show a paginated staff activity report (one page per staff member).
-        Page 1 is the summary header; subsequent pages are per-member breakdowns.
+        Show a staff activity report as separate messages.
+        The summary header, each staff member, and any continuation pages are
+        posted as individual messages instead of being placed behind buttons.
         Usage: !staffactivity [week_offset]
           week_offset: 0 = current week (default), 1 = last week, 2 = two weeks ago
 
@@ -2238,8 +2239,11 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             title_suffix=suffix,
         )
         await ctx.message.add_reaction("✅")
-        view = PageView(pages)
-        await ch.send(embed=pages[0], view=view)
+        # Keep every report page as its own Discord message. This prevents the
+        # report from becoming a button-controlled paginator and lets each
+        # staff member's log remain visible independently.
+        for page in pages:
+            await ch.send(embed=page)
 
     @commands.command(name="modlogdelete", aliases=["delmodlog", "deletemodlog", "modlogdel"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
