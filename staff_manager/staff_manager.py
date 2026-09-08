@@ -1436,8 +1436,17 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             week_dt=week_dt,
             title_suffix=title_suffix,
         )
-        view = PageView(pages)
-        await ch.send(embed=pages[0], view=view)
+        # Post the report as separate Discord messages:
+        #   1. One summary/header message.
+        #   2. One message for each staff member.
+        #
+        # _fields_to_pages() already splits a staff member's activity across
+        # continuation embeds when Discord's embed limits are reached. Sending
+        # every page separately means those continuation pages become their own
+        # messages instead of being hidden behind a paginator/editing one
+        # shared message.
+        for page in pages:
+            await ch.send(embed=page)
 
     # ------------------------------------------------------------------ #
     # LOA expiry checker                                                   #
