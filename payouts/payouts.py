@@ -1,927 +1,695 @@
-"""
-Staff payouts plugin for Modmail.
+"""Staff strike tracking for ModMail.
 
-This plugin follows Modmail's plugin contract:
-    <repository-root>/payouts/payouts.py
+Commands:
+    .strike <member> <duration>
+    .rstrike <member>
+    .mystrikes [member]
+    .allstrikes
 
-Configure the values in CONFIG before loading the plugin.
+The prefix is controlled by ModMail, so the commands also work if the server
+uses a prefix other than ".".
 """
 
 from __future__ import annotations
 
-import logging
+import re
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 import discord
 from discord.ext import commands
 
-from core import checks
-from core.checks import PermissionLevel
+try:
+    # This works when the whole plugin package is present.
+    from . import config
+except ImportError:
+    # Some ModMail plugin loaders copy/load only the extension file and do not
+    # expose sibling modules. Keep a complete fallback so the plugin still
+    # loads in that format.
+    class _InlineConfig:
+        STAFF_TEAM_ROLE_ID = 1461572126174875886
+        GAME_ADMIN_ROLE_ID = 1490692440146051092
+        STAFF_RANKS = [
+            {"name": "Trial Moderator", "role_id": 1457047936465633381},
+            {"name": "Moderator", "role_id": 1457049978030653460},
+            {"name": "Senior Moderator", "role_id": 1458421728718880791},
+            {"name": "Staff Management", "role_id": 1457039931351367872},
+            {"name": "Overseer", "role_id": 1546847847067025509},
+            {"name": "Head of Staff", "role_id": 1458892950309441709},
+            {"name": "Admin", "role_id": 1424785285782438089},
+            {"name": "Head Admin", "role_id": 1272561419061297184},
+        ]
+        STRIKE_AUTHORITY_RANK = "Staff Management"
+        ALL_STRIKES_AUTHORITY_RANKS = {"Admin", "Head Admin"}
+        EXTRA_STAFF_ROLE_IDS_TO_REMOVE = set()
+        MAX_STRIKES = 3
+
+    config = _InlineConfig()
 
 
-logger = logging.getLogger(__name__)
+UTC = timezone.utc
+ACKNOWLEDGEMENT_WINDOW = timedelta(hours=24)
+DURATION_PATTERN = re.compile(
+    r"^(?P<amount>\d+(?:\.\d+)?)(?P<unit>s|m|h|d|w|mo|y)$",
+    re.IGNORECASE,
+)
+DURATION_UNITS = {
+    "s": "seconds",
+    "m": "minutes",
+    "h": "hours",
+    "d": "days",
+    "w": "weeks",
+    # A calendar month cannot be represented exactly without a dependency.
+    # Treating it as 30 days is predictable and is explained in the help text.
+    "mo": "days",
+    "y": "days",
+}
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def parse_duration(value: str) -> Optional[timedelta]:
+    """Parse a strike duration, or return None for a permanent strike."""
+    normalized = value.strip().lower()
+    if normalized in {"perm", "permanent", "forever"}:
+        return None
+
+    match = DURATION_PATTERN.fullmatch(normalized)
+    if not match:
+        raise ValueError(
+            "Duration must look like `30m`, `12h`, `7d`, `2w`, `1mo`, "
+            "`1y`, or `permanent`."
+        )
+
+    amount = float(match.group("amount"))
+    unit = match.group("unit").lower()
+    if amount <= 0:
+        raise ValueError("Duration must be greater than zero.")
+
+    keyword = DURATION_UNITS[unit]
+    if unit == "mo":
+        amount *= 30
+    elif unit == "y":
+        amount *= 365
+
+    return timedelta(**{keyword: amount})
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize MongoDB's naive datetimes and timezone-aware datetimes."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def acknowledgement_deadline(strike: dict[str, Any]) -> Optional[datetime]:
+    explicit_deadline = as_utc(strike.get("ack_deadline"))
+    if explicit_deadline is not None:
+        return explicit_deadline
+
+    issued_at = as_utc(strike.get("issued_at"))
+    return issued_at + ACKNOWLEDGEMENT_WINDOW if issued_at is not None else None
+
+
+def format_duration(expires_at: Optional[datetime]) -> str:
+    if expires_at is None:
+        return "permanent"
+    remaining = as_utc(expires_at) - utc_now()
+    if remaining.total_seconds() <= 0:
+        return "expired"
+    seconds = int(remaining.total_seconds())
+    if seconds < 60:
+        return f"{seconds}s remaining"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m remaining"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h remaining"
+    days = hours // 24
+    return f"{days}d remaining"
 
 
 @dataclass(frozen=True)
-class PayoutConfig:
-    """Values that are specific to the server using this plugin."""
-
-    # Set this to the server where payouts are managed.
-    guild_id: int | None = None
-
-    # Add every role whose members should receive the open/close DMs.
-    target_role_ids: tuple[int, ...] = ()
-
-    # Add the Discord ID of the person who reviews payout requests.
-    # Multiple IDs are supported if more than one reviewer should receive requests.
-    reviewer_user_ids: tuple[int, ...] = ()
-
-    # This is displayed in applicant approval/denial DMs.
-    head_administrator_name: str = "im_azv"
-
-    # Rank text containing one of these values receives the extra question.
-    in_game_admin_rank_keywords: tuple[str, ...] = (
-        "in-game admin",
-        "ingame admin",
-        "in game admin",
-    )
+class Rank:
+    name: str
+    role_id: int
+    level: int
 
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-# Replace the empty values below with your server's IDs before installing.
-CONFIG = PayoutConfig(
-    guild_id=None,  # Example: 123456789012345678
-    target_role_ids=(
-         1484613327442284795,
-         1461572126174875886,
-         1490692440146051092,
-    ),
-    reviewer_user_ids=(
-         1272561419061297184,
-    ),
-    head_administrator_name="Azv",
-)
+class AcknowledgeView(discord.ui.View):
+    """Persistent DM button for one strike notice."""
 
-
-OPEN_FORM_CUSTOM_ID = "payouts:open-form"
-AMOUNT_FORM_CUSTOM_ID = "payouts:amount-form"
-APPROVE_CUSTOM_ID = "payouts:approve"
-DENY_CUSTOM_ID = "payouts:deny"
-
-
-def _new_application_id() -> str:
-    """Create a short, human-readable ID for a payout application."""
-
-    return uuid.uuid4().hex[:10].upper()
-
-
-def _is_in_game_admin(rank: str) -> bool:
-    rank_text = rank.casefold()
-    return any(keyword.casefold() in rank_text for keyword in CONFIG.in_game_admin_rank_keywords)
-
-
-def _application_id_from_message(message: discord.Message | None) -> str | None:
-    """Read the application ID from the footer of a reviewer embed."""
-
-    if message is None or not message.embeds:
-        return None
-
-    footer = message.embeds[0].footer.text or ""
-    prefix = "Application ID: "
-    if not footer.startswith(prefix):
-        return None
-    return footer.removeprefix(prefix).strip() or None
-
-
-class PayoutOpenView(discord.ui.View):
-    """Persistent view delivered to eligible members when payouts open."""
-
-    def __init__(self, plugin: "Payouts") -> None:
+    def __init__(
+        self,
+        plugin: "StaffStrikes",
+        guild_id: int,
+        member_id: int,
+        strike_id: str,
+        acknowledged: bool = False,
+    ):
         super().__init__(timeout=None)
         self.plugin = plugin
+        self.guild_id = guild_id
+        self.member_id = member_id
+        self.strike_id = strike_id
 
-    @discord.ui.button(
-        label="Fill out payout form",
-        style=discord.ButtonStyle.primary,
-        custom_id=OPEN_FORM_CUSTOM_ID,
-    )
-    async def open_form(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[PayoutOpenView],
-    ) -> None:
-        if not self.plugin.payouts_open:
-            await interaction.response.send_message(
-                "Staff payouts are currently closed.",
-                ephemeral=True,
-            )
-            return
-
-        if await self.plugin.has_active_application(interaction.user.id):
-            await interaction.response.send_message(
-                "You already have a payout application being reviewed.",
-                ephemeral=True,
-            )
-            return
-
-        submission_block = await self.plugin.payout_submission_block_reason(
-            interaction.user.id,
-            interaction.guild_id,
+        button = discord.ui.Button(
+            label="Acknowledged" if acknowledged else "Acknowledge",
+            style=discord.ButtonStyle.success if acknowledged else discord.ButtonStyle.primary,
+            custom_id=f"staff_strike:ack:{guild_id}:{strike_id}",
+            disabled=acknowledged,
         )
-        if submission_block is not None:
-            await interaction.response.send_message(submission_block, ephemeral=True)
-            return
+        button.callback = self.acknowledge
+        self.add_item(button)
 
-        await interaction.response.send_modal(PayoutDetailsModal(self.plugin))
-
-
-class PayoutAmountView(discord.ui.View):
-    """Persistent view for the conditional In-Game Admin question."""
-
-    def __init__(self, plugin: "Payouts") -> None:
-        super().__init__(timeout=None)
-        self.plugin = plugin
-
-    @discord.ui.button(
-        label="Continue application",
-        style=discord.ButtonStyle.primary,
-        custom_id=AMOUNT_FORM_CUSTOM_ID,
-    )
-    async def open_amount_form(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[PayoutAmountView],
-    ) -> None:
-        if not self.plugin.payouts_open:
+    async def acknowledge(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.member_id:
             await interaction.response.send_message(
-                "Staff payouts are currently closed.",
+                "Only the staff member who received this strike can acknowledge it.",
                 ephemeral=True,
             )
             return
 
-        application = await self.plugin.find_waiting_for_amount(interaction.user.id)
-        if application is None:
+        result = await self.plugin.acknowledge_strike(
+            self.guild_id, self.member_id, self.strike_id
+        )
+        if result == "missing":
             await interaction.response.send_message(
-                "That payout form is no longer waiting for this question.",
+                "This strike could not be found. It may have been removed already.",
+                ephemeral=True,
+            )
+            return
+        if result == "removed":
+            await interaction.response.send_message(
+                "This strike has already been removed by staff.",
+                ephemeral=True,
+            )
+            return
+        if result == "expired":
+            await interaction.response.send_message(
+                "The 24-hour acknowledgement deadline has passed. "
+                "This strike cannot be acknowledged now, and it will make the "
+                "recipient ineligible for the next payout.",
+                ephemeral=True,
+            )
+            return
+        if result == "already":
+            await interaction.response.send_message(
+                "This strike has already been acknowledged.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_modal(PayoutAmountModal(self.plugin))
-
-
-class PayoutReviewView(discord.ui.View):
-    """Persistent reviewer controls shared by every reviewer message."""
-
-    def __init__(self, plugin: "Payouts", *, disabled: bool = False) -> None:
-        super().__init__(timeout=None)
-        self.plugin = plugin
         for item in self.children:
             if isinstance(item, discord.ui.Button):
-                item.disabled = disabled
+                item.label = "Acknowledged"
+                item.style = discord.ButtonStyle.success
+                item.disabled = True
 
-    @discord.ui.button(
-        label="Approve payout",
-        style=discord.ButtonStyle.success,
-        custom_id=APPROVE_CUSTOM_ID,
-    )
-    async def approve(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[PayoutReviewView],
-    ) -> None:
-        await self.plugin.handle_review_decision(interaction, approved=True)
+        await interaction.response.edit_message(
+            content="Strike acknowledged.",
+            view=self,
+        )
 
-    @discord.ui.button(
-        label="Deny payout",
-        style=discord.ButtonStyle.danger,
-        custom_id=DENY_CUSTOM_ID,
-    )
-    async def deny(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button[PayoutReviewView],
-    ) -> None:
-        application_id = _application_id_from_message(interaction.message)
-        if application_id is None:
-            await interaction.response.send_message(
-                "This review message is missing its application ID.",
-                ephemeral=True,
-            )
+
+class StaffStrikes(commands.Cog):
+    """Track time-limited staff strikes in a ModMail plugin partition."""
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.collection = bot.api.get_plugin_partition(self)
+        self.ranks = self._load_ranks()
+        self.rank_by_name = {rank.name.casefold(): rank for rank in self.ranks}
+
+    @staticmethod
+    def _load_ranks() -> list[Rank]:
+        ranks: list[Rank] = []
+        for level, entry in enumerate(config.STAFF_RANKS):
+            name = str(entry.get("name", "")).strip()
+            role_id = int(entry.get("role_id", 0))
+            if not name or role_id <= 0:
+                continue
+            ranks.append(Rank(name=name, role_id=role_id, level=level))
+        return ranks
+
+    @property
+    def configured(self) -> bool:
+        return (
+            config.STAFF_TEAM_ROLE_ID > 0
+            and bool(self.ranks)
+            and config.STRIKE_AUTHORITY_RANK.casefold() in self.rank_by_name
+        )
+
+    @property
+    def removable_staff_role_ids(self) -> set[int]:
+        role_ids = {rank.role_id for rank in self.ranks}
+        role_ids.add(config.STAFF_TEAM_ROLE_ID)
+        if config.GAME_ADMIN_ROLE_ID > 0:
+            role_ids.add(config.GAME_ADMIN_ROLE_ID)
+        role_ids.update(
+            role_id for role_id in config.EXTRA_STAFF_ROLE_IDS_TO_REMOVE if role_id > 0
+        )
+        return role_ids
+
+    def highest_rank(self, member: discord.Member) -> Optional[Rank]:
+        member_role_ids = {role.id for role in member.roles}
+        matching = [rank for rank in self.ranks if rank.role_id in member_role_ids]
+        return max(matching, key=lambda rank: rank.level, default=None)
+
+    def is_staff(self, member: discord.Member) -> bool:
+        role_ids = {role.id for role in member.roles}
+        return bool(
+            config.STAFF_TEAM_ROLE_ID in role_ids
+            or config.GAME_ADMIN_ROLE_ID in role_ids
+            or any(rank.role_id in role_ids for rank in self.ranks)
+        )
+
+    def has_strike_authority(self, member: discord.Member) -> bool:
+        rank = self.highest_rank(member)
+        required = self.rank_by_name.get(config.STRIKE_AUTHORITY_RANK.casefold())
+        return rank is not None and required is not None and rank.level >= required.level
+
+    def has_all_strikes_authority(self, member: discord.Member) -> bool:
+        rank = self.highest_rank(member)
+        allowed_levels = {
+            self.rank_by_name[name.casefold()].level
+            for name in config.ALL_STRIKES_AUTHORITY_RANKS
+            if name.casefold() in self.rank_by_name
+        }
+        return rank is not None and rank.level in allowed_levels
+
+    @commands.Cog.listener()
+    async def on_plugins_ready(self) -> None:
+        """Re-register acknowledgement buttons after a bot restart."""
+        if not self.configured:
             return
 
-        await interaction.response.send_modal(
-            PayoutDenialModal(self.plugin, application_id)
+        cursor = self.collection.find({})
+        async for record in cursor:
+            for strike in self.pending_acknowledgements(record):
+                if not strike.get("acknowledged", False):
+                    self.bot.add_view(
+                        AcknowledgeView(
+                            self,
+                            int(record["guild_id"]),
+                            int(record["user_id"]),
+                            str(strike["id"]),
+                        )
+                    )
+
+    @staticmethod
+    def active_strikes(record: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not record:
+            return []
+        now = utc_now()
+        active: list[dict[str, Any]] = []
+        for strike in record.get("strikes", []):
+            if strike.get("removed_at") is not None:
+                continue
+            expires_at = as_utc(strike.get("expires_at"))
+            if expires_at is None or expires_at > now:
+                active.append(strike)
+        return active
+
+    @staticmethod
+    def pending_acknowledgements(
+        record: Optional[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not record:
+            return []
+        return [
+            strike
+            for strike in record.get("strikes", [])
+            if not strike.get("acknowledged", False)
+            and strike.get("removed_at") is None
+        ]
+
+    async def get_record(self, guild_id: int, member_id: int) -> Optional[dict[str, Any]]:
+        return await self.collection.find_one(
+            {"guild_id": str(guild_id), "user_id": str(member_id)}
         )
 
-
-class PayoutDenialModal(discord.ui.Modal, title="Deny payout"):
-    """Collect the reason shown to an applicant when a payout is denied."""
-
-    reason = discord.ui.TextInput(
-        label="Reason for denial",
-        placeholder="Explain why this payout request was denied",
-        max_length=1000,
-        required=True,
-        style=discord.TextStyle.paragraph,
-    )
-
-    def __init__(self, plugin: "Payouts", application_id: str) -> None:
-        super().__init__()
-        self.plugin = plugin
-        self.application_id = application_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.plugin.handle_review_decision(
-            interaction,
-            approved=False,
-            application_id=self.application_id,
-            denial_reason=str(self.reason.value).strip(),
-        )
-
-
-class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
-    """The first four payout questions."""
-
-    roblox_username = discord.ui.TextInput(
-        label="Roblox Username",
-        placeholder="Example: XxLeonCakeWoofxX",
-        max_length=100,
-        required=True,
-    )
-    discord_username = discord.ui.TextInput(
-        label="Discord Username",
-        placeholder="Example: slayinglooty",
-        max_length=100,
-        required=True,
-    )
-    discord_id = discord.ui.TextInput(
-        label="Discord ID",
-        placeholder="Enable Developer Mode to copy it",
-        max_length=30,
-        required=True,
-    )
-    current_rank = discord.ui.TextInput(
-        label="Current Rank in Server",
-        placeholder="Example: Bot Developer, In-Game Admin, or another staff rank",
-        max_length=150,
-        required=True,
-    )
-    requested_amount = discord.ui.TextInput(
-        label="Requested payout amount",
-        placeholder="Example: 50 Souls and 100 Diamonds",
-        max_length=50,
-        required=True,
-    )
-
-    def __init__(self, plugin: "Payouts") -> None:
-        super().__init__()
-        self.plugin = plugin
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.plugin.receive_details(
-            interaction,
-            {
-                "roblox_username": str(self.roblox_username.value).strip(),
-                "discord_username": str(self.discord_username.value).strip(),
-                "discord_id": str(self.discord_id.value).strip(),
-                "current_rank": str(self.current_rank.value).strip(),
-                "requested_amount": str(self.requested_amount.value).strip(),
-            },
-        )
-
-
-class PayoutAmountModal(discord.ui.Modal, title="In-Game Admin details"):
-    """The additional question shown only to In-Game Admins."""
-
-    amount_moderated = discord.ui.TextInput(
-        label="Amount of people moderated",
-        placeholder="Enter the number of people you moderated",
-        max_length=30,
-        required=True,
-    )
-
-    def __init__(self, plugin: "Payouts") -> None:
-        super().__init__()
-        self.plugin = plugin
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.plugin.receive_amount(
-            interaction,
-            str(self.amount_moderated.value).strip(),
-        )
-
-
-class Payouts(commands.Cog):
-    """Open, collect, and review staff payout applications."""
-
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
-        self.db = self.bot.plugin_db.get_partition(self)
-        self.payouts_open = False
-        self.payout_cycle_id: str | None = None
-        self.payout_guild_id: int | None = None
-
-    async def cog_load(self) -> None:
-        """Restore the open/closed state when Modmail loads the plugin."""
-
-        state = await self.db.find_one({"_id": "state"})
-        self.payouts_open = bool(state and state.get("payouts_open", False))
-        self.payout_cycle_id = state.get("payout_cycle_id") if state else None
-        self.payout_guild_id = (
-            int(state["payout_guild_id"])
-            if state and state.get("payout_guild_id")
-            else None
-        )
-        if self.payouts_open and self.payout_cycle_id is None:
-            self.payout_cycle_id = _new_application_id()
-            await self.db.find_one_and_update(
-                {"_id": "state"},
-                {"$set": {"payout_cycle_id": self.payout_cycle_id}},
-                upsert=True,
-            )
-
-    def _configuration_errors(self) -> list[str]:
-        errors: list[str] = []
-        if not CONFIG.target_role_ids:
-            errors.append("set at least one target role ID")
-        if not CONFIG.reviewer_user_ids:
-            errors.append("set at least one reviewer user ID")
-        return errors
-
-    async def _set_payout_state(
+    async def save_record(
         self,
-        is_open: bool,
-        guild_id: int | None = None,
-    ) -> None:
-        if is_open and not self.payouts_open:
-            self.payout_cycle_id = _new_application_id()
-
-        if guild_id is not None:
-            self.payout_guild_id = guild_id
-        self.payouts_open = is_open
-        await self.db.find_one_and_update(
-            {"_id": "state"},
-            {
-                "$set": {
-                    "payouts_open": is_open,
-                    "payout_cycle_id": self.payout_cycle_id,
-                    "payout_guild_id": self.payout_guild_id,
-                }
-            },
+        guild_id: int,
+        member_id: int,
+        strikes: list[dict[str, Any]],
+        display_name: str,
+    ) -> dict[str, Any]:
+        record = {
+            "guild_id": str(guild_id),
+            "user_id": str(member_id),
+            "display_name": display_name,
+            "strikes": strikes,
+            "updated_at": utc_now(),
+        }
+        await self.collection.replace_one(
+            {"guild_id": str(guild_id), "user_id": str(member_id)},
+            record,
             upsert=True,
         )
+        return record
 
-    async def _get_guild(self, fallback_guild: discord.Guild | None = None) -> discord.Guild | None:
-        guild_id = CONFIG.guild_id or (fallback_guild.id if fallback_guild else None)
-        if guild_id is None:
-            return None
-
-        guild = self.bot.get_guild(guild_id)
-        if guild is not None:
-            return guild
-
-        try:
-            return await self.bot.fetch_guild(guild_id)
-        except discord.HTTPException:
-            logger.exception("Unable to fetch configured payout guild %s", guild_id)
-            return None
-
-    async def _get_target_members(
-        self,
-        fallback_guild: discord.Guild | None = None,
-    ) -> list[discord.Member]:
-        guild = await self._get_guild(fallback_guild)
-        if guild is None:
-            return []
-
-        # Role membership requires the members intent and a populated member cache.
-        try:
-            if not guild.chunked:
-                await guild.chunk(cache=True)
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception(
-                "Unable to populate members for payout role DMs. "
-                "Enable the Server Members Intent for the Modmail bot."
-            )
-
-        members = guild.members
-        if not members:
-            try:
-                members = [member async for member in guild.fetch_members(limit=None)]
-            except (discord.Forbidden, discord.HTTPException):
-                logger.exception("Unable to fetch members for payout role DMs.")
-                return []
-
-        target_role_ids = set(CONFIG.target_role_ids)
-        return [
-            member
-            for member in members
-            if not member.bot and any(role.id in target_role_ids for role in member.roles)
-        ]
-
-    async def _send_open_dm(self, member: discord.Member) -> bool:
-        embed = discord.Embed(
-            title="Staff Payouts Are Open",
-            description=(
-                "Staff payouts are now open. Click the button below to fill out "
-                "your payout application."
-            ),
-            color=discord.Color.green(),
-        )
-        try:
-            await member.send(embed=embed, view=PayoutOpenView(self))
-            return True
-        except (discord.Forbidden, discord.HTTPException):
-            logger.warning("Could not DM payout opening notice to member %s.", member.id)
-            return False
-
-    async def _send_close_dm(self, member: discord.Member) -> bool:
-        embed = discord.Embed(
-            title="Staff Payouts Are Closed",
-            description=(
-                "Staff payouts have been closed. The administration team is no longer "
-                "accepting payout applications."
-            ),
-            color=discord.Color.red(),
-        )
-        try:
-            await member.send(embed=embed)
-            return True
-        except (discord.Forbidden, discord.HTTPException):
-            logger.warning("Could not DM payout closing notice to member %s.", member.id)
-            return False
-
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @commands.command(name="payoutsopen")
-    async def payouts_open_command(self, ctx: commands.Context[Any]) -> None:
-        """Open payouts and DM every member with a configured target role."""
-
-        errors = self._configuration_errors()
-        if errors:
-            await ctx.send(f"Payouts plugin is not configured: {', '.join(errors)}.")
-            return
-
-        await self._set_payout_state(True, ctx.guild.id)
-        members = await self._get_target_members(ctx.guild)
-        sent = sum([await self._send_open_dm(member) for member in members])
-        await ctx.send(
-            f"Staff payouts are now open. Sent {sent} opening DM(s) to eligible members."
-        )
-
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @commands.command(name="payoutsclose")
-    async def payouts_close_command(self, ctx: commands.Context[Any]) -> None:
-        """Close payouts and notify every member with a configured target role."""
-
-        errors = self._configuration_errors()
-        if errors:
-            await ctx.send(f"Payouts plugin is not configured: {', '.join(errors)}.")
-            return
-
-        await self._set_payout_state(False, ctx.guild.id)
-        members = await self._get_target_members(ctx.guild)
-        sent = sum([await self._send_close_dm(member) for member in members])
-        await ctx.send(
-            f"Staff payouts are now closed. Sent {sent} closing DM(s) to eligible members."
-        )
-
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @commands.command(name="payoutapproved")
-    async def payout_approved_command(self, ctx: commands.Context[Any]) -> None:
-        """Display every staff member whose payout application was approved."""
-
-        applications = [
-            application
-            async for application in self.db.find({"status": "approved"})
-        ]
-        eligible_applications: list[dict[str, Any]] = []
-        withheld_applications: list[tuple[dict[str, Any], str]] = []
-        for application in applications:
-            block_reason = await self._staff_strike_block_reason(
-                int(application["applicant_id"]),
-                ctx.guild.id,
-                application.get("payout_cycle_id"),
-            )
-            if block_reason is None:
-                eligible_applications.append(application)
-            else:
-                withheld_applications.append((application, block_reason))
-        applications = eligible_applications
-        applications.sort(
-            key=lambda application: (
-                str(application.get("discord_username", "")).casefold(),
-                str(application.get("_id", "")),
-            )
-        )
-
-        if not applications:
-            if withheld_applications:
-                await ctx.send(
-                    "No approved payouts are currently eligible. "
-                    f"{len(withheld_applications)} payout(s) were withheld because "
-                    "the recipient missed a strike acknowledgement deadline."
+    async def acknowledge_strike(
+        self, guild_id: int, member_id: int, strike_id: str
+    ) -> str:
+        record = await self.get_record(guild_id, member_id)
+        if not record:
+            return "missing"
+        for strike in record.get("strikes", []):
+            if str(strike.get("id")) == strike_id:
+                if strike.get("removed_at") is not None:
+                    return "removed"
+                if strike.get("acknowledged", False):
+                    return "already"
+                deadline = acknowledgement_deadline(strike)
+                if deadline is not None and deadline <= utc_now():
+                    return "expired"
+                strike["acknowledged"] = True
+                strike["acknowledged_at"] = utc_now()
+                await self.save_record(
+                    guild_id,
+                    member_id,
+                    record.get("strikes", []),
+                    record.get("display_name", str(member_id)),
                 )
-            else:
-                await ctx.send("No staff payout applications have been approved yet.")
-            return
+                return "acknowledged"
+        return "missing"
 
-        lines = [
-            f"**{index}. {application.get('discord_username', 'Unknown Discord user')}** "
-            f"({application.get('roblox_username', 'Unknown Roblox user')})\n"
-            f"Discord: <@{application.get('applicant_id', application.get('discord_id', '0'))}> "
-            f"(`{application.get('discord_id', 'unknown')}`)\n"
-            f"Rank: {application.get('current_rank', 'Unknown')}\n"
-            f"Requested amount: {application.get('requested_amount', 'Not provided')}"
-            for index, application in enumerate(applications, start=1)
-        ]
-
-        header = f"**Approved staff payouts ({len(applications)})**"
-        chunks: list[str] = []
-        current = header
-        for line in lines:
-            if len(current) + len(line) + 2 > 1900:
-                chunks.append(current)
-                current = line
-            else:
-                current = f"{current}\n\n{line}"
-        chunks.append(current)
-
-        for chunk in chunks:
-            await ctx.send(chunk)
-        if withheld_applications:
-            await ctx.send(
-                f"{len(withheld_applications)} approved payout(s) were withheld "
-                "because the recipient missed a strike acknowledgement deadline."
-            )
-
-    async def _staff_strike_block_reason(
+    async def payout_block_reason(
         self,
-        user_id: int,
-        guild_id: int | None = None,
-        payout_cycle_id: str | None = None,
-    ) -> str | None:
-        """Ask the separate StaffStrikes cog whether this user missed a deadline."""
-        strike_plugin = self.bot.get_cog("StaffStrikes")
-        resolved_guild_id = guild_id or CONFIG.guild_id or self.payout_guild_id
-        if resolved_guild_id is None:
-            return (
-                "Payout eligibility could not be verified because the payout "
-                "server is not configured."
-            )
-        if strike_plugin is None:
-            return (
-                "Payout eligibility could not be verified because the Staff "
-                "Strikes plugin is not loaded."
-            )
-        return await strike_plugin.payout_block_reason(
-            resolved_guild_id,
-            user_id,
-            payout_cycle_id or self.payout_cycle_id,
-        )
-
-    async def payout_submission_block_reason(
-        self,
-        user_id: int,
-        guild_id: int | None = None,
-    ) -> str | None:
-        """Return a user-facing reason when an applicant already submitted this cycle."""
-
-        strike_block = await self._staff_strike_block_reason(user_id, guild_id)
-        if strike_block is not None:
-            return strike_block
-
-        applications = [
-            application
-            async for application in self.db.find(
-                {
-                    "applicant_id": str(user_id),
-                    "payout_cycle_id": self.payout_cycle_id,
-                }
-            )
-        ]
-        if applications:
-            return (
-                "You have already submitted a payout request for this payout cycle. "
-                "You can submit another request when the next payout cycle opens."
-            )
+        guild_id: int,
+        member_id: int,
+        payout_cycle_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return a reason when a missed strike acknowledgement blocks payout."""
+        record = await self.get_record(guild_id, member_id)
+        now = utc_now()
+        changed = False
+        for strike in self.pending_acknowledgements(record):
+            deadline = acknowledgement_deadline(strike)
+            if deadline is not None and deadline <= now:
+                blocked_cycle_id = strike.get("payout_blocked_cycle_id")
+                if (
+                    payout_cycle_id is not None
+                    and blocked_cycle_id is not None
+                    and blocked_cycle_id != payout_cycle_id
+                ):
+                    continue
+                if payout_cycle_id is not None and blocked_cycle_id != payout_cycle_id:
+                    strike["payout_blocked_cycle_id"] = payout_cycle_id
+                    changed = True
+                if changed:
+                    await self.save_record(
+                        guild_id,
+                        member_id,
+                        record.get("strikes", []),
+                        record.get("display_name", str(member_id)),
+                    )
+                return (
+                    "Payout withheld: a staff strike was not acknowledged within "
+                    f"24 hours (deadline {discord.utils.format_dt(deadline, 'F')}). "
+                    "This applies to the current payout cycle only."
+                )
         return None
 
-    async def has_active_application(self, user_id: int) -> bool:
-        for status in ("awaiting_amount", "pending"):
-            if await self.db.find_one(
-                {"applicant_id": str(user_id), "status": status}
-            ):
-                return True
+    async def ensure_ready(self, ctx: commands.Context) -> bool:
+        if self.configured:
+            return True
+        await ctx.send(
+            "Staff strikes are not configured yet. Add the staff role IDs and "
+            "rank order in `staff_strikes/config.py`."
+        )
         return False
 
-    async def find_waiting_for_amount(self, user_id: int) -> dict[str, Any] | None:
-        return await self.db.find_one(
-            {"applicant_id": str(user_id), "status": "awaiting_amount"}
-        )
+    async def resolve_member(self, ctx: commands.Context, value: str) -> discord.Member:
+        try:
+            return await commands.MemberConverter().convert(ctx, value)
+        except commands.MemberNotFound:
+            raise commands.BadArgument(
+                "I could not find that server member. Use their username, mention, or ID."
+            )
 
-    async def receive_details(
-        self,
-        interaction: discord.Interaction,
-        details: dict[str, str],
+    async def remove_staff_roles(self, member: discord.Member) -> list[str]:
+        roles = [
+            role for role in member.roles if role.id in self.removable_staff_role_ids
+        ]
+        if not roles:
+            return []
+        await member.remove_roles(
+            *roles,
+            reason="Reached the maximum number of active staff strikes",
+        )
+        return [role.name for role in roles]
+
+    @commands.command(
+        name="strike",
+        help="Issue a timed staff strike: .strike <username/id> <duration>.",
+    )
+    @commands.guild_only()
+    async def strike(
+        self, ctx: commands.Context, member_value: str, duration_value: str
     ) -> None:
-        await interaction.response.defer(ephemeral=True)
+        if not await self.ensure_ready(ctx):
+            return
+        issuer = ctx.author
+        if not isinstance(issuer, discord.Member) or not self.has_strike_authority(issuer):
+            await ctx.send("Only Staff Management and higher ranks can issue strikes.")
+            return
 
-        if not self.payouts_open:
-            await interaction.followup.send(
-                "Staff payouts are currently closed.",
-                ephemeral=True,
+        member = await self.resolve_member(ctx, member_value)
+        if not self.is_staff(member):
+            await ctx.send("Strikes can only be applied to staff team members.")
+            return
+
+        issuer_rank = self.highest_rank(issuer)
+        target_rank = self.highest_rank(member)
+        if issuer_rank is None or target_rank is None:
+            await ctx.send("Both the issuer and target must have a configured staff rank.")
+            return
+        if target_rank.level > issuer_rank.level:
+            await ctx.send("You cannot strike a staff member ranked higher than you.")
+            return
+
+        try:
+            duration = parse_duration(duration_value)
+        except ValueError as error:
+            await ctx.send(str(error))
+            return
+
+        now = utc_now()
+        expires_at = now + duration if duration is not None else None
+        record = await self.get_record(ctx.guild.id, member.id)
+        stored_strikes = list(record.get("strikes", [])) if record else []
+        strikes = self.active_strikes(record)
+        if len(strikes) >= config.MAX_STRIKES:
+            await ctx.send(
+                f"{member.mention} already has {config.MAX_STRIKES} active strikes "
+                "and has had their staff roles removed."
             )
             return
 
-        if await self.has_active_application(interaction.user.id):
-            await interaction.followup.send(
-                "You already have a payout application being reviewed.",
-                ephemeral=True,
-            )
-            return
-
-        submission_block = await self.payout_submission_block_reason(
-            interaction.user.id,
-            interaction.guild_id,
-        )
-        if submission_block is not None:
-            await interaction.followup.send(submission_block, ephemeral=True)
-            return
-
-        application_id = _new_application_id()
-        application: dict[str, Any] = {
-            "_id": application_id,
-            "applicant_id": str(interaction.user.id),
-            "applicant_tag": str(interaction.user),
-            "status": "pending",
-            "amount_moderated": None,
-            "denial_reason": None,
-            "payout_cycle_id": self.payout_cycle_id,
-            **details,
+        strike = {
+            "id": uuid.uuid4().hex,
+            "issued_by_id": str(issuer.id),
+            "issued_by_name": str(issuer),
+            "issued_at": now,
+            "expires_at": expires_at,
+            "ack_deadline": now + ACKNOWLEDGEMENT_WINDOW,
+            "acknowledged": False,
+            "acknowledged_at": None,
         }
+        stored_strikes.append(strike)
+        await self.save_record(ctx.guild.id, member.id, stored_strikes, str(member))
+        active_count = len(strikes) + 1
 
-        if _is_in_game_admin(details["current_rank"]):
-            application["status"] = "awaiting_amount"
-            await self.db.insert_one(application)
-            await interaction.followup.send(
-                "Because you selected an In-Game Admin rank, please answer the "
-                "additional question below.",
-                view=PayoutAmountView(self),
-                ephemeral=True,
-            )
-            return
-
-        await self.db.insert_one(application)
-        reviewer_count = await self.notify_reviewers(application)
-        await interaction.followup.send(
-            "Your payout application has been submitted for review."
-            if reviewer_count
-            else (
-                "Your payout application was saved, but no configured reviewer "
-                "could be notified."
-            ),
-            ephemeral=True,
-        )
-
-    async def receive_amount(
-        self,
-        interaction: discord.Interaction,
-        amount_moderated: str,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-
-        if not self.payouts_open:
-            await interaction.followup.send(
-                "Staff payouts are currently closed.",
-                ephemeral=True,
-            )
-            return
-
-        application = await self.find_waiting_for_amount(interaction.user.id)
-        if application is None:
-            await interaction.followup.send(
-                "That payout form is no longer waiting for an amount.",
-                ephemeral=True,
-            )
-            return
-
-        submission_block = await self.payout_submission_block_reason(
-            interaction.user.id,
-            interaction.guild_id,
-        )
-        if submission_block is not None:
-            await interaction.followup.send(submission_block, ephemeral=True)
-            return
-
-        await self.db.find_one_and_update(
-            {"_id": application["_id"], "status": "awaiting_amount"},
-            {
-                "$set": {
-                    "status": "pending",
-                    "amount_moderated": amount_moderated,
-                }
-            },
-        )
-        application["status"] = "pending"
-        application["amount_moderated"] = amount_moderated
-        reviewer_count = await self.notify_reviewers(application)
-        await interaction.followup.send(
-            "Your payout application has been submitted for review."
-            if reviewer_count
-            else (
-                "Your payout application was saved, but no configured reviewer "
-                "could be notified."
-            ),
-            ephemeral=True,
-        )
-
-    def _review_embed(self, application: dict[str, Any]) -> discord.Embed:
-        embed = discord.Embed(
-            title="New Staff Payout Request",
-            description="Use the buttons below to approve or deny this request.",
-            color=discord.Color.gold(),
-        )
-        embed.add_field(
-            name="Roblox Username",
-            value=application["roblox_username"],
-            inline=True,
-        )
-        embed.add_field(
-            name="Discord Username",
-            value=application["discord_username"],
-            inline=True,
-        )
-        embed.add_field(
-            name="Discord ID",
-            value=application["discord_id"],
-            inline=True,
-        )
-        embed.add_field(
-            name="Current Rank in Server",
-            value=application["current_rank"],
-            inline=False,
-        )
-        embed.add_field(
-            name="Requested Payout Amount",
-            value=application.get("requested_amount", "Not provided"),
-            inline=False,
-        )
-        if application.get("amount_moderated") is not None:
-            embed.add_field(
-                name="Amount of people moderated",
-                value=str(application["amount_moderated"]),
-                inline=False,
-            )
-        embed.add_field(
-            name="Applicant",
-            value=f"<@{application['applicant_id']}> ({application['applicant_tag']})",
-            inline=False,
-        )
-        embed.set_footer(text=f"Application ID: {application['_id']}")
-        return embed
-
-    async def notify_reviewers(self, application: dict[str, Any]) -> int:
-        sent = 0
-        for user_id in CONFIG.reviewer_user_ids:
-            try:
-                reviewer = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
-                await reviewer.send(
-                    embed=self._review_embed(application),
-                    view=PayoutReviewView(self),
+        view = AcknowledgeView(self, ctx.guild.id, member.id, strike["id"])
+        self.bot.add_view(view)
+        dm_sent = True
+        try:
+            await member.send(
+                embed=discord.Embed(
+                    title="Staff strike issued",
+                    description=(
+                        f"You have received **strike {active_count}/{config.MAX_STRIKES}** "
+                        f"in **{ctx.guild.name}**."
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=now,
                 )
-                sent += 1
+                .add_field(name="Issued by", value=issuer.mention)
+                .add_field(name="Duration", value=format_duration(expires_at))
+                .add_field(
+                    name="Acknowledge by",
+                    value=discord.utils.format_dt(strike["ack_deadline"], "F"),
+                )
+                .set_footer(
+                    text="You have 24 hours to acknowledge this notice. "
+                    "Missing the deadline makes you ineligible for the next payout."
+                ),
+                view=view,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            dm_sent = False
+
+        roles_removed: list[str] = []
+        if active_count >= config.MAX_STRIKES:
+            try:
+                roles_removed = await self.remove_staff_roles(member)
             except (discord.Forbidden, discord.HTTPException):
-                logger.warning("Could not DM payout reviewer %s.", user_id)
-        return sent
+                await ctx.send(
+                    "The strike was recorded, but I could not remove the staff roles. "
+                    "Check that my bot role is above those roles."
+                )
+                roles_removed = []
 
-    async def handle_review_decision(
-        self,
-        interaction: discord.Interaction,
-        *,
-        approved: bool,
-        application_id: str | None = None,
-        denial_reason: str | None = None,
+        message = (
+            f"Recorded strike {active_count}/{config.MAX_STRIKES} for {member.mention} "
+            f"({format_duration(expires_at)})."
+        )
+        if roles_removed:
+            message += " Maximum reached; removed: " + ", ".join(roles_removed) + "."
+        if not dm_sent:
+            message += " I could not DM them; their privacy settings may block DMs."
+        await ctx.send(message)
+
+    @commands.command(
+        name="rstrike",
+        help="Remove the most recent active strike: .rstrike <username/id>.",
+    )
+    @commands.guild_only()
+    async def remove_strike(self, ctx: commands.Context, member_value: str) -> None:
+        if not await self.ensure_ready(ctx):
+            return
+        issuer = ctx.author
+        if not isinstance(issuer, discord.Member) or not self.has_strike_authority(issuer):
+            await ctx.send("Only Staff Management and higher ranks can remove strikes.")
+            return
+
+        member = await self.resolve_member(ctx, member_value)
+        if not self.is_staff(member):
+            await ctx.send("Strikes can only be managed for staff team members.")
+            return
+
+        issuer_rank = self.highest_rank(issuer)
+        target_rank = self.highest_rank(member)
+        if issuer_rank is None or target_rank is None:
+            await ctx.send("Both the issuer and target must have a configured staff rank.")
+            return
+        if target_rank.level > issuer_rank.level:
+            await ctx.send("You cannot remove a strike from a staff member ranked higher than you.")
+            return
+
+        record = await self.get_record(ctx.guild.id, member.id)
+        stored_strikes = list(record.get("strikes", [])) if record else []
+        strikes = self.active_strikes(record)
+        if not strikes:
+            await ctx.send(f"{member.mention} has no active strikes.")
+            return
+
+        removed = strikes[-1]
+        removed["removed_at"] = utc_now()
+        removed["removed_by_id"] = str(issuer.id)
+        await self.save_record(ctx.guild.id, member.id, stored_strikes, str(member))
+        remaining_count = len(strikes) - 1
+        await ctx.send(
+            f"Removed the most recent active strike from {member.mention}. "
+            f"They now have {remaining_count}/{config.MAX_STRIKES} active strikes."
+        )
+
+    @commands.command(
+        name="mystrikes",
+        help="View your strikes, or another staff member's strikes: .mystrikes [username/id].",
+    )
+    @commands.guild_only()
+    async def my_strikes(
+        self, ctx: commands.Context, member_value: Optional[str] = None
     ) -> None:
-        if interaction.user.id not in CONFIG.reviewer_user_ids:
-            await interaction.response.send_message(
-                "You are not configured to review payout applications.",
-                ephemeral=True,
-            )
+        if not await self.ensure_ready(ctx):
+            return
+        if not isinstance(ctx.author, discord.Member) or not self.is_staff(ctx.author):
+            await ctx.send("Only staff team members can use this command.")
             return
 
-        application_id = application_id or _application_id_from_message(interaction.message)
-        if application_id is None:
-            await interaction.response.send_message(
-                "This review message is missing its application ID.",
-                ephemeral=True,
-            )
+        member = (
+            await self.resolve_member(ctx, member_value)
+            if member_value
+            else ctx.author
+        )
+        if not self.is_staff(member):
+            await ctx.send("Strikes can only be viewed for staff team members.")
             return
 
-        application = await self.db.find_one({"_id": application_id})
-        if application is None:
-            await interaction.response.send_message(
-                "That payout application could not be found.",
-                ephemeral=True,
-            )
+        record = await self.get_record(ctx.guild.id, member.id)
+        strikes = self.active_strikes(record)
+        lines = [
+            f"**{index}.** {format_duration(strike.get('expires_at'))} "
+            f"— {'acknowledged' if strike.get('acknowledged') else 'not acknowledged'}"
+            for index, strike in enumerate(strikes, start=1)
+        ]
+        description = "\n".join(lines) if lines else "No active strikes."
+        await ctx.send(
+            embed=discord.Embed(
+                title=f"Strikes for {member}",
+                description=description,
+                color=discord.Color.orange() if strikes else discord.Color.green(),
+            ).set_footer(text=f"{len(strikes)}/{config.MAX_STRIKES} active strikes"),
+        )
+
+    @commands.command(
+        name="allstrikes",
+        help="View every staff member with active strikes.",
+    )
+    @commands.guild_only()
+    async def all_strikes(self, ctx: commands.Context) -> None:
+        if not await self.ensure_ready(ctx):
+            return
+        if not isinstance(ctx.author, discord.Member) or not self.has_all_strikes_authority(
+            ctx.author
+        ):
+            await ctx.send("Only Admin and Head Admin can use this command.")
             return
 
-        if application.get("status") != "pending":
-            await interaction.response.send_message(
-                f"This application has already been {application.get('status', 'processed')}.",
-                ephemeral=True,
-            )
-            return
-
-        if approved:
-            strike_block = await self._staff_strike_block_reason(
-                int(application["applicant_id"]),
-                payout_cycle_id=application.get("payout_cycle_id"),
-            )
-            if strike_block is not None:
-                await interaction.response.send_message(
-                    f"This payout cannot be approved. {strike_block}",
-                    ephemeral=True,
+        cursor = self.collection.find({"guild_id": str(ctx.guild.id)})
+        lines: list[str] = []
+        async for record in cursor:
+            strikes = self.active_strikes(record)
+            if strikes:
+                lines.append(
+                    f"<@{record['user_id']}> — {len(strikes)}/{config.MAX_STRIKES} "
+                    f"active strike(s)"
                 )
-                return
 
-        status = "approved" if approved else "denied"
-        await self.db.find_one_and_update(
-            {"_id": application_id, "status": "pending"},
-            {
-                "$set": {
-                    "status": status,
-                    "reviewer_id": str(interaction.user.id),
-                    "reviewed_at": discord.utils.utcnow().isoformat(),
-                    "denial_reason": denial_reason if not approved else None,
-                }
-            },
-        )
-
-        await interaction.response.defer()
-        applicant_id = int(application["applicant_id"])
-        applicant = self.bot.get_user(applicant_id)
-        if applicant is None:
-            try:
-                applicant = await self.bot.fetch_user(applicant_id)
-            except (discord.NotFound, discord.HTTPException):
-                applicant = None
-
-        applicant_dm_sent = False
-        if applicant is not None:
-            if approved:
-                message = (
-                    "Your staff payout application has been approved. "
-                    f"Please wait for a Head Administrator to DM you. "
-                    f"Head Administrator: {CONFIG.head_administrator_name}"
-                )
-            else:
-                message = (
-                    "Your staff payout application has been denied. "
-                    f"Reason: {denial_reason or 'No reason was provided.'} "
-                    f"If there is a problem, DM {CONFIG.head_administrator_name}, "
-                    "Head Administrator."
-                )
-            try:
-                await applicant.send(message)
-                applicant_dm_sent = True
-            except (discord.Forbidden, discord.HTTPException):
-                logger.warning("Could not DM payout decision to applicant %s.", applicant_id)
-
-        decision_embed = self._review_embed(application)
-        decision_embed.title = (
-            "Staff Payout Request Approved" if approved else "Staff Payout Request Denied"
-        )
-        decision_embed.description = (
-            f"Decision by {interaction.user}."
-            + ("" if applicant_dm_sent else " The applicant could not be DM'd.")
-        )
-        if not approved:
-            decision_embed.add_field(
-                name="Denial Reason",
-                value=denial_reason or "No reason was provided.",
-                inline=False,
+        description = "\n".join(lines) if lines else "No staff members have active strikes."
+        await ctx.send(
+            embed=discord.Embed(
+                title="All active staff strikes",
+                description=description,
+                color=discord.Color.orange() if lines else discord.Color.green(),
             )
-        decision_embed.color = discord.Color.green() if approved else discord.Color.red()
-        await interaction.message.edit(
-            embed=decision_embed,
-            view=PayoutReviewView(self, disabled=True),
         )
-        await interaction.followup.send(
-            f"Payout application {application_id} has been {status}.",
-            ephemeral=True,
-        )
+
+    async def cog_command_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"Missing argument: `{error.param.name}`.")
+            return
+        if isinstance(error, commands.BadArgument):
+            await ctx.send(str(error))
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await ctx.send("These commands can only be used inside the server.")
+            return
+        raise error
 
 
 async def setup(bot: commands.Bot) -> None:
-    plugin = Payouts(bot)
-    await bot.add_cog(plugin)
-
-    # All custom IDs are fixed, so these views continue working after a restart.
-    bot.add_view(PayoutOpenView(plugin))
-    bot.add_view(PayoutAmountView(plugin))
-    bot.add_view(PayoutReviewView(plugin))
+    await bot.add_cog(StaffStrikes(bot))
