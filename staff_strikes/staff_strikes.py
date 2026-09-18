@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 try:
     # This works when the whole plugin package is present.
@@ -31,6 +31,7 @@ except ImportError:
     class _InlineConfig:
         STAFF_TEAM_ROLE_ID = 1461572126174875886
         GAME_ADMIN_ROLE_ID = 1490692440146051092
+        NOTIFICATION_USER_ID = 1272561419061297184
         STAFF_RANKS = [
             {"name": "Trial Moderator", "role_id": 1457047936465633381},
             {"name": "Moderator", "role_id": 1457049978030653460},
@@ -50,7 +51,7 @@ except ImportError:
 
 
 UTC = timezone.utc
-ACKNOWLEDGEMENT_WINDOW = timedelta(hours=24)
+ACKNOWLEDGEMENT_WINDOW = timedelta(hours=48)
 DURATION_PATTERN = re.compile(
     r"^(?P<amount>\d+(?:\.\d+)?)(?P<unit>s|m|h|d|w|mo|y)$",
     re.IGNORECASE,
@@ -194,7 +195,7 @@ class AcknowledgeView(discord.ui.View):
             return
         if result == "expired":
             await interaction.response.send_message(
-                "The 24-hour acknowledgement deadline has passed. "
+                "The 48-hour acknowledgement deadline has passed. "
                 "This strike cannot be acknowledged now, and it will make the "
                 "recipient ineligible for the next payout.",
                 ephemeral=True,
@@ -303,6 +304,113 @@ class StaffStrikes(commands.Cog):
                             str(strike["id"]),
                         )
                     )
+        if not self.acknowledgement_monitor.is_running():
+            self.acknowledgement_monitor.start()
+
+    @tasks.loop(minutes=5)
+    async def acknowledgement_monitor(self) -> None:
+        """Notify Azv when a strike passes its acknowledgement deadline."""
+        cursor = self.collection.find({})
+        now = utc_now()
+        async for record in cursor:
+            changed = False
+            for strike in self.pending_acknowledgements(record):
+                deadline = acknowledgement_deadline(strike)
+                if (
+                    deadline is None
+                    or deadline > now
+                    or strike.get("missed_ack_notified_at") is not None
+                ):
+                    continue
+                if await self.notify_missed_acknowledgement(record, strike):
+                    strike["missed_ack_notified_at"] = now
+                    changed = True
+            if changed:
+                await self.save_record(
+                    int(record["guild_id"]),
+                    int(record["user_id"]),
+                    record.get("strikes", []),
+                    record.get("display_name", str(record["user_id"])),
+                )
+
+    @acknowledgement_monitor.before_loop
+    async def before_acknowledgement_monitor(self) -> None:
+        await self.bot.wait_until_ready()
+
+    def cog_unload(self) -> None:
+        self.acknowledgement_monitor.cancel()
+
+    async def send_notification_to_azv(self, embed: discord.Embed) -> bool:
+        notification_user_id = int(getattr(config, "NOTIFICATION_USER_ID", 0))
+        if notification_user_id <= 0:
+            return False
+        try:
+            user = self.bot.get_user(notification_user_id)
+            if user is None:
+                user = await self.bot.fetch_user(notification_user_id)
+            await user.send(embed=embed)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    def notification_target_name(
+        self, record: dict[str, Any], guild: Optional[discord.Guild]
+    ) -> str:
+        member_id = int(record.get("user_id", 0))
+        if guild is not None:
+            member = guild.get_member(member_id)
+            if member is not None:
+                return f"{member} ({member.mention})"
+        return f"{record.get('display_name', 'Unknown staff member')} (`{member_id}`)"
+
+    async def notify_acknowledged(
+        self, record: dict[str, Any], strike: dict[str, Any]
+    ) -> bool:
+        guild = self.bot.get_guild(int(record["guild_id"]))
+        target = self.notification_target_name(record, guild)
+        embed = discord.Embed(
+            title="Staff strike acknowledged",
+            description=f"{target} acknowledged their staff strike.",
+            color=discord.Color.green(),
+            timestamp=utc_now(),
+        )
+        embed.add_field(
+            name="Acknowledged at",
+            value=discord.utils.format_dt(
+                as_utc(strike.get("acknowledged_at")) or utc_now(), "F"
+            ),
+        )
+        embed.add_field(
+            name="Strike issued by",
+            value=str(strike.get("issued_by_name", "Unknown")),
+        )
+        return await self.send_notification_to_azv(embed)
+
+    async def notify_missed_acknowledgement(
+        self, record: dict[str, Any], strike: dict[str, Any]
+    ) -> bool:
+        guild = self.bot.get_guild(int(record["guild_id"]))
+        target = self.notification_target_name(record, guild)
+        deadline = acknowledgement_deadline(strike)
+        embed = discord.Embed(
+            title="Staff strike acknowledgement missed",
+            description=(
+                f"{target} did not acknowledge their staff strike within 48 hours. "
+                "They are blocked from the next payout cycle."
+            ),
+            color=discord.Color.orange(),
+            timestamp=utc_now(),
+        )
+        if deadline is not None:
+            embed.add_field(
+                name="Deadline",
+                value=discord.utils.format_dt(deadline, "F"),
+            )
+        embed.add_field(
+            name="Strike issued by",
+            value=str(strike.get("issued_by_name", "Unknown")),
+        )
+        return await self.send_notification_to_azv(embed)
 
     @staticmethod
     def active_strikes(record: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -380,6 +488,7 @@ class StaffStrikes(commands.Cog):
                     record.get("strikes", []),
                     record.get("display_name", str(member_id)),
                 )
+                await self.notify_acknowledged(record, strike)
                 return "acknowledged"
         return "missing"
 
@@ -406,6 +515,10 @@ class StaffStrikes(commands.Cog):
                 if payout_cycle_id is not None and blocked_cycle_id != payout_cycle_id:
                     strike["payout_blocked_cycle_id"] = payout_cycle_id
                     changed = True
+                if strike.get("missed_ack_notified_at") is None:
+                    if await self.notify_missed_acknowledgement(record, strike):
+                        strike["missed_ack_notified_at"] = now
+                        changed = True
                 if changed:
                     await self.save_record(
                         guild_id,
@@ -415,7 +528,7 @@ class StaffStrikes(commands.Cog):
                     )
                 return (
                     "Payout withheld: a staff strike was not acknowledged within "
-                    f"24 hours (deadline {discord.utils.format_dt(deadline, 'F')}). "
+                    f"48 hours (deadline {discord.utils.format_dt(deadline, 'F')}). "
                     "This applies to the current payout cycle only."
                 )
         return None
@@ -531,7 +644,7 @@ class StaffStrikes(commands.Cog):
                     value=discord.utils.format_dt(strike["ack_deadline"], "F"),
                 )
                 .set_footer(
-                    text="You have 24 hours to acknowledge this notice. "
+                    text="You have 48 hours to acknowledge this notice. "
                     "Missing the deadline makes you ineligible for the next payout."
                 ),
                 view=view,
@@ -550,14 +663,29 @@ class StaffStrikes(commands.Cog):
                 )
                 roles_removed = []
 
+        deadline_text = discord.utils.format_dt(strike["ack_deadline"], "F")
         message = (
-            f"Recorded strike {active_count}/{config.MAX_STRIKES} for {member.mention} "
-            f"({format_duration(expires_at)})."
+            "⚠️ **Staff strike issued**\n"
+            f"Target: {member.mention}\n"
+            f"Strike level: **{active_count}/{config.MAX_STRIKES}**\n"
+            f"Duration: **{format_duration(expires_at)}**\n"
+            f"Acknowledge by: **{deadline_text}**\n\n"
+            "The target has been sent a DM with an acknowledgement button. "
+            "They have **48 hours** to acknowledge this strike. "
+            "If they do not acknowledge it before the deadline, they will be "
+            "blocked from the next payout cycle."
         )
         if roles_removed:
-            message += " Maximum reached; removed: " + ", ".join(roles_removed) + "."
+            message += (
+                "\n\n**Maximum active strikes reached.** Removed staff roles: "
+                + ", ".join(roles_removed)
+                + "."
+            )
         if not dm_sent:
-            message += " I could not DM them; their privacy settings may block DMs."
+            message += (
+                "\n\n⚠️ I could not DM the target; their privacy settings may "
+                "be blocking DMs."
+            )
         await ctx.send(message)
 
     @commands.command(
