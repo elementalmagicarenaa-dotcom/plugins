@@ -7,6 +7,9 @@ Role IDs must be integers. The order in STAFF_RANKS is lowest to highest.
 # The role applied to every member of the staff team.
 STAFF_TEAM_ROLE_ID = 1461572126174875886
 
+# Discord user ID to receive acknowledgement and missed-deadline notifications.
+NOTIFICATION_USER_ID = 1272561419061297184
+
 # A separate role that should count as staff for this plugin.
 GAME_ADMIN_ROLE_ID = 1490692440146051092
 
