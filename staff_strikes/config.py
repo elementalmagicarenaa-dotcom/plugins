@@ -29,7 +29,7 @@ STAFF_RANKS = [
     {"name": "Overseer", "role_id": 1546847847067025509},
     {"name": "Head of Staff", "role_id": 1458892950309441709},
     {"name": "Admin", "role_id": 1424785285782438089},
-    {"name": "Head Admin", "role_id": 1272561419061297184},
+    {"name": "Head Admin", "role_id": 1484601981006774423},
 ]
 
 # The lowest rank allowed to issue or remove strikes.
