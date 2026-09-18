@@ -32,6 +32,7 @@ except ImportError:
         STAFF_TEAM_ROLE_ID = 1461572126174875886
         GAME_ADMIN_ROLE_ID = 1490692440146051092
         NOTIFICATION_USER_ID = 1272561419061297184
+        STRIKE_LOG_CHANNEL_ID = 1550494565897605180
         STAFF_RANKS = [
             {"name": "Trial Moderator", "role_id": 1457047936465633381},
             {"name": "Moderator", "role_id": 1457049978030653460},
@@ -319,12 +320,19 @@ class StaffStrikes(commands.Cog):
                 if (
                     deadline is None
                     or deadline > now
-                    or strike.get("missed_ack_notified_at") is not None
+                    or (
+                        strike.get("missed_ack_notified_at") is not None
+                        and strike.get("missed_ack_log_sent_at") is not None
+                    )
                 ):
                     continue
                 if await self.notify_missed_acknowledgement(record, strike):
                     strike["missed_ack_notified_at"] = now
                     changed = True
+                if strike.get("missed_ack_log_sent_at") is None:
+                    if await self.log_missed_acknowledgement(record, strike):
+                        strike["missed_ack_log_sent_at"] = now
+                        changed = True
             if changed:
                 await self.save_record(
                     int(record["guild_id"]),
@@ -349,6 +357,19 @@ class StaffStrikes(commands.Cog):
             if user is None:
                 user = await self.bot.fetch_user(notification_user_id)
             await user.send(embed=embed)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def send_strike_log(self, embed: discord.Embed) -> bool:
+        channel_id = int(getattr(config, "STRIKE_LOG_CHANNEL_ID", 0))
+        if channel_id <= 0:
+            return False
+        try:
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                channel = await self.bot.fetch_channel(channel_id)
+            await channel.send(embed=embed)
             return True
         except (discord.Forbidden, discord.HTTPException):
             return False
@@ -386,6 +407,29 @@ class StaffStrikes(commands.Cog):
         )
         return await self.send_notification_to_azv(embed)
 
+    async def log_acknowledged(
+        self, record: dict[str, Any], strike: dict[str, Any]
+    ) -> bool:
+        guild = self.bot.get_guild(int(record["guild_id"]))
+        target = self.notification_target_name(record, guild)
+        embed = discord.Embed(
+            title="Staff strike acknowledged",
+            description=f"{target} acknowledged their staff strike.",
+            color=discord.Color.green(),
+            timestamp=utc_now(),
+        )
+        embed.add_field(
+            name="Acknowledged at",
+            value=discord.utils.format_dt(
+                as_utc(strike.get("acknowledged_at")) or utc_now(), "F"
+            ),
+        )
+        embed.add_field(
+            name="Strike issued by",
+            value=str(strike.get("issued_by_name", "Unknown")),
+        )
+        return await self.send_strike_log(embed)
+
     async def notify_missed_acknowledgement(
         self, record: dict[str, Any], strike: dict[str, Any]
     ) -> bool:
@@ -411,6 +455,93 @@ class StaffStrikes(commands.Cog):
             value=str(strike.get("issued_by_name", "Unknown")),
         )
         return await self.send_notification_to_azv(embed)
+
+    async def log_missed_acknowledgement(
+        self, record: dict[str, Any], strike: dict[str, Any]
+    ) -> bool:
+        guild = self.bot.get_guild(int(record["guild_id"]))
+        target = self.notification_target_name(record, guild)
+        deadline = acknowledgement_deadline(strike)
+        embed = discord.Embed(
+            title="Staff strike acknowledgement missed",
+            description=(
+                f"{target} did not acknowledge their staff strike within 48 hours. "
+                "The next payout cycle is blocked."
+            ),
+            color=discord.Color.orange(),
+            timestamp=utc_now(),
+        )
+        if deadline is not None:
+            embed.add_field(
+                name="Deadline",
+                value=discord.utils.format_dt(deadline, "F"),
+            )
+        embed.add_field(
+            name="Strike issued by",
+            value=str(strike.get("issued_by_name", "Unknown")),
+        )
+        return await self.send_strike_log(embed)
+
+    async def log_strike_issued(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        issuer: discord.Member,
+        strike: dict[str, Any],
+        active_count: int,
+        expires_at: Optional[datetime],
+        roles_removed: list[str],
+        dm_sent: bool,
+    ) -> bool:
+        embed = discord.Embed(
+            title="Staff strike issued",
+            description=f"{member.mention} received a staff strike.",
+            color=discord.Color.red(),
+            timestamp=as_utc(strike.get("issued_at")) or utc_now(),
+        )
+        embed.add_field(name="Member", value=f"{member} ({member.mention})")
+        embed.add_field(name="Issued by", value=f"{issuer} ({issuer.mention})")
+        embed.add_field(
+            name="Strike level",
+            value=f"{active_count}/{config.MAX_STRIKES}",
+        )
+        embed.add_field(name="Duration", value=format_duration(expires_at))
+        embed.add_field(
+            name="Acknowledge by",
+            value=discord.utils.format_dt(strike["ack_deadline"], "F"),
+        )
+        embed.add_field(name="DM delivered", value="Yes" if dm_sent else "No")
+        if roles_removed:
+            embed.add_field(
+                name="Roles removed",
+                value=", ".join(roles_removed),
+                inline=False,
+            )
+        embed.set_footer(text=f"Guild: {guild.name}")
+        return await self.send_strike_log(embed)
+
+    async def log_strike_removed(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        issuer: discord.Member,
+        strike: dict[str, Any],
+        remaining_count: int,
+    ) -> bool:
+        embed = discord.Embed(
+            title="Staff strike removed",
+            description=f"{member.mention}'s most recent active strike was removed.",
+            color=discord.Color.blue(),
+            timestamp=as_utc(strike.get("removed_at")) or utc_now(),
+        )
+        embed.add_field(name="Member", value=f"{member} ({member.mention})")
+        embed.add_field(name="Removed by", value=f"{issuer} ({issuer.mention})")
+        embed.add_field(
+            name="Remaining active strikes",
+            value=f"{remaining_count}/{config.MAX_STRIKES}",
+        )
+        embed.set_footer(text=f"Guild: {guild.name}")
+        return await self.send_strike_log(embed)
 
     @staticmethod
     def active_strikes(record: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -489,6 +620,7 @@ class StaffStrikes(commands.Cog):
                     record.get("display_name", str(member_id)),
                 )
                 await self.notify_acknowledged(record, strike)
+                await self.log_acknowledged(record, strike)
                 return "acknowledged"
         return "missing"
 
@@ -518,6 +650,10 @@ class StaffStrikes(commands.Cog):
                 if strike.get("missed_ack_notified_at") is None:
                     if await self.notify_missed_acknowledgement(record, strike):
                         strike["missed_ack_notified_at"] = now
+                        changed = True
+                if strike.get("missed_ack_log_sent_at") is None:
+                    if await self.log_missed_acknowledgement(record, strike):
+                        strike["missed_ack_log_sent_at"] = now
                         changed = True
                 if changed:
                     await self.save_record(
@@ -686,6 +822,16 @@ class StaffStrikes(commands.Cog):
                 "\n\n⚠️ I could not DM the target; their privacy settings may "
                 "be blocking DMs."
             )
+        await self.log_strike_issued(
+            ctx.guild,
+            member,
+            issuer,
+            strike,
+            active_count,
+            expires_at,
+            roles_removed,
+            dm_sent,
+        )
         await ctx.send(message)
 
     @commands.command(
@@ -725,8 +871,16 @@ class StaffStrikes(commands.Cog):
         removed = strikes[-1]
         removed["removed_at"] = utc_now()
         removed["removed_by_id"] = str(issuer.id)
+        removed["removed_by_name"] = str(issuer)
         await self.save_record(ctx.guild.id, member.id, stored_strikes, str(member))
         remaining_count = len(strikes) - 1
+        await self.log_strike_removed(
+            ctx.guild,
+            member,
+            issuer,
+            removed,
+            remaining_count,
+        )
         await ctx.send(
             f"Removed the most recent active strike from {member.mention}. "
             f"They now have {remaining_count}/{config.MAX_STRIKES} active strikes."
