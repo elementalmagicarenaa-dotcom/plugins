@@ -129,7 +129,8 @@ class PayoutOpenView(discord.ui.View):
             return
 
         submission_block = await self.plugin.payout_submission_block_reason(
-            interaction.user.id
+            interaction.user.id,
+            interaction.guild_id,
         )
         if submission_block is not None:
             await interaction.response.send_message(submission_block, ephemeral=True)
@@ -323,6 +324,7 @@ class Payouts(commands.Cog):
         self.db = self.bot.plugin_db.get_partition(self)
         self.payouts_open = False
         self.payout_cycle_id: str | None = None
+        self.payout_guild_id: int | None = None
 
     async def cog_load(self) -> None:
         """Restore the open/closed state when Modmail loads the plugin."""
@@ -330,6 +332,11 @@ class Payouts(commands.Cog):
         state = await self.db.find_one({"_id": "state"})
         self.payouts_open = bool(state and state.get("payouts_open", False))
         self.payout_cycle_id = state.get("payout_cycle_id") if state else None
+        self.payout_guild_id = (
+            int(state["payout_guild_id"])
+            if state and state.get("payout_guild_id")
+            else None
+        )
         if self.payouts_open and self.payout_cycle_id is None:
             self.payout_cycle_id = _new_application_id()
             await self.db.find_one_and_update(
@@ -346,10 +353,16 @@ class Payouts(commands.Cog):
             errors.append("set at least one reviewer user ID")
         return errors
 
-    async def _set_payout_state(self, is_open: bool) -> None:
+    async def _set_payout_state(
+        self,
+        is_open: bool,
+        guild_id: int | None = None,
+    ) -> None:
         if is_open and not self.payouts_open:
             self.payout_cycle_id = _new_application_id()
 
+        if guild_id is not None:
+            self.payout_guild_id = guild_id
         self.payouts_open = is_open
         await self.db.find_one_and_update(
             {"_id": "state"},
@@ -357,6 +370,7 @@ class Payouts(commands.Cog):
                 "$set": {
                     "payouts_open": is_open,
                     "payout_cycle_id": self.payout_cycle_id,
+                    "payout_guild_id": self.payout_guild_id,
                 }
             },
             upsert=True,
@@ -452,7 +466,7 @@ class Payouts(commands.Cog):
             await ctx.send(f"Payouts plugin is not configured: {', '.join(errors)}.")
             return
 
-        await self._set_payout_state(True)
+        await self._set_payout_state(True, ctx.guild.id)
         members = await self._get_target_members(ctx.guild)
         sent = sum([await self._send_open_dm(member) for member in members])
         await ctx.send(
@@ -469,7 +483,7 @@ class Payouts(commands.Cog):
             await ctx.send(f"Payouts plugin is not configured: {', '.join(errors)}.")
             return
 
-        await self._set_payout_state(False)
+        await self._set_payout_state(False, ctx.guild.id)
         members = await self._get_target_members(ctx.guild)
         sent = sum([await self._send_close_dm(member) for member in members])
         await ctx.send(
@@ -485,6 +499,19 @@ class Payouts(commands.Cog):
             application
             async for application in self.db.find({"status": "approved"})
         ]
+        eligible_applications: list[dict[str, Any]] = []
+        withheld_applications: list[tuple[dict[str, Any], str]] = []
+        for application in applications:
+            block_reason = await self._staff_strike_block_reason(
+                int(application["applicant_id"]),
+                ctx.guild.id,
+                application.get("payout_cycle_id"),
+            )
+            if block_reason is None:
+                eligible_applications.append(application)
+            else:
+                withheld_applications.append((application, block_reason))
+        applications = eligible_applications
         applications.sort(
             key=lambda application: (
                 str(application.get("discord_username", "")).casefold(),
@@ -493,7 +520,14 @@ class Payouts(commands.Cog):
         )
 
         if not applications:
-            await ctx.send("No staff payout applications have been approved yet.")
+            if withheld_applications:
+                await ctx.send(
+                    "No approved payouts are currently eligible. "
+                    f"{len(withheld_applications)} payout(s) were withheld because "
+                    "the recipient missed a strike acknowledgement deadline."
+                )
+            else:
+                await ctx.send("No staff payout applications have been approved yet.")
             return
 
         lines = [
@@ -519,9 +553,47 @@ class Payouts(commands.Cog):
 
         for chunk in chunks:
             await ctx.send(chunk)
+        if withheld_applications:
+            await ctx.send(
+                f"{len(withheld_applications)} approved payout(s) were withheld "
+                "because the recipient missed a strike acknowledgement deadline."
+            )
 
-    async def payout_submission_block_reason(self, user_id: int) -> str | None:
+    async def _staff_strike_block_reason(
+        self,
+        user_id: int,
+        guild_id: int | None = None,
+        payout_cycle_id: str | None = None,
+    ) -> str | None:
+        """Ask the separate StaffStrikes cog whether this user missed a deadline."""
+        strike_plugin = self.bot.get_cog("StaffStrikes")
+        resolved_guild_id = guild_id or CONFIG.guild_id or self.payout_guild_id
+        if resolved_guild_id is None:
+            return (
+                "Payout eligibility could not be verified because the payout "
+                "server is not configured."
+            )
+        if strike_plugin is None:
+            return (
+                "Payout eligibility could not be verified because the Staff "
+                "Strikes plugin is not loaded."
+            )
+        return await strike_plugin.payout_block_reason(
+            resolved_guild_id,
+            user_id,
+            payout_cycle_id or self.payout_cycle_id,
+        )
+
+    async def payout_submission_block_reason(
+        self,
+        user_id: int,
+        guild_id: int | None = None,
+    ) -> str | None:
         """Return a user-facing reason when an applicant already submitted this cycle."""
+
+        strike_block = await self._staff_strike_block_reason(user_id, guild_id)
+        if strike_block is not None:
+            return strike_block
 
         applications = [
             application
@@ -573,7 +645,10 @@ class Payouts(commands.Cog):
             )
             return
 
-        submission_block = await self.payout_submission_block_reason(interaction.user.id)
+        submission_block = await self.payout_submission_block_reason(
+            interaction.user.id,
+            interaction.guild_id,
+        )
         if submission_block is not None:
             await interaction.followup.send(submission_block, ephemeral=True)
             return
@@ -633,6 +708,14 @@ class Payouts(commands.Cog):
                 "That payout form is no longer waiting for an amount.",
                 ephemeral=True,
             )
+            return
+
+        submission_block = await self.payout_submission_block_reason(
+            interaction.user.id,
+            interaction.guild_id,
+        )
+        if submission_block is not None:
+            await interaction.followup.send(submission_block, ephemeral=True)
             return
 
         await self.db.find_one_and_update(
@@ -753,6 +836,18 @@ class Payouts(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        if approved:
+            strike_block = await self._staff_strike_block_reason(
+                int(application["applicant_id"]),
+                payout_cycle_id=application.get("payout_cycle_id"),
+            )
+            if strike_block is not None:
+                await interaction.response.send_message(
+                    f"This payout cannot be approved. {strike_block}",
+                    ephemeral=True,
+                )
+                return
 
         status = "approved" if approved else "denied"
         await self.db.find_one_and_update(
