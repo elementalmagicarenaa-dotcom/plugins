@@ -7,7 +7,7 @@ plugin's MongoDB partition; no direct access to ``bot.api`` is used.
 from __future__ import annotations
 
 import asyncio
-import logging
+import logginga
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -161,6 +161,66 @@ def pending_acknowledgements(record: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+class StrikeAcknowledgementView(discord.ui.View):
+    """Persistent DM button that lets only the strike recipient acknowledge."""
+
+    def __init__(
+        self,
+        cog: StaffStrikes,
+        guild_id: int,
+        member_id: int,
+        strike_id: str,
+        *,
+        disabled: bool = False,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.member_id = member_id
+        self.strike_id = strike_id
+
+        button = discord.ui.Button(
+            label="Acknowledged" if disabled else "Acknowledge",
+            style=discord.ButtonStyle.success,
+            custom_id=f"staffstrike:ack:{guild_id}:{member_id}:{strike_id}",
+            disabled=disabled,
+        )
+        button.callback = self.acknowledge
+        self.add_item(button)
+
+    async def acknowledge(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "Only the member who received this strike can acknowledge it.",
+                ephemeral=True,
+            )
+            return
+
+        strike = await self.cog._mark_strike_acknowledged(
+            self.guild_id,
+            self.member_id,
+            self.strike_id,
+        )
+        if strike is None:
+            await interaction.response.send_message(
+                "This strike is no longer awaiting acknowledgement.",
+                ephemeral=True,
+            )
+            return
+
+        acknowledged_view = self.cog._acknowledgement_view(
+            self.guild_id,
+            self.member_id,
+            self.strike_id,
+            disabled=True,
+        )
+        self.cog._ack_views_by_message[interaction.message.id] = acknowledged_view
+        await interaction.response.edit_message(
+            content="Strike acknowledged.",
+            view=acknowledged_view,
+        )
+
+
 class StaffStrikes(commands.Cog, name="StaffStrikes"):
     """Track staff strikes, acknowledgements, and role removal at the limit."""
 
@@ -203,6 +263,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
         # ModMail's plugin API gives each plugin an isolated Mongo collection.
         self.collection = bot.api.get_plugin_partition(self)
         self._locks: defaultdict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._ack_views_by_message: dict[int, StrikeAcknowledgementView] = {}
 
     @staticmethod
     def _positive_id(setting_name: str) -> int:
@@ -215,10 +276,57 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
         self.acknowledgement_monitor.change_interval(
             minutes=self.acknowledgement_check_minutes
         )
+        await self._register_pending_acknowledgement_views()
         self.acknowledgement_monitor.start()
 
     def cog_unload(self) -> None:
         self.acknowledgement_monitor.cancel()
+        for message_id, view in self._ack_views_by_message.items():
+            self.bot.remove_view(view, message_id=message_id)
+        self._ack_views_by_message.clear()
+
+    async def _register_pending_acknowledgement_views(self) -> None:
+        async for record in self.collection.find({}):
+            guild_id = int(record.get("guild_id", 0))
+            member_id = int(record.get("member_id", 0))
+            if not guild_id or not member_id:
+                continue
+
+            for strike in record.get("strikes", []):
+                message_id = strike.get("ack_message_id")
+                strike_id = str(strike.get("id", ""))
+                if (
+                    strike.get("status") != "active"
+                    or strike.get("acknowledged_at") is not None
+                    or not message_id
+                    or not strike_id
+                ):
+                    continue
+
+                view = self._acknowledgement_view(
+                    guild_id,
+                    member_id,
+                    strike_id,
+                )
+                message_id = int(message_id)
+                self.bot.add_view(view, message_id=message_id)
+                self._ack_views_by_message[message_id] = view
+
+    def _acknowledgement_view(
+        self,
+        guild_id: int,
+        member_id: int,
+        strike_id: str,
+        *,
+        disabled: bool = False,
+    ) -> StrikeAcknowledgementView:
+        return StrikeAcknowledgementView(
+            self,
+            guild_id,
+            member_id,
+            strike_id,
+            disabled=disabled,
+        )
 
     @tasks.loop(minutes=5)
     async def acknowledgement_monitor(self) -> None:
@@ -435,26 +543,96 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             return False
         return True
 
-    async def _send_strike_dm(
+    @staticmethod
+    def _format_remaining(deadline: datetime | None) -> str:
+        if deadline is None:
+            return "not configured"
+        seconds = int((deadline - utc_now()).total_seconds())
+        if seconds <= 0:
+            return "Expired"
+
+        days, remainder = divmod(seconds, 24 * 60 * 60)
+        hours, remainder = divmod(remainder, 60 * 60)
+        minutes = remainder // 60
+        if days:
+            return f"{days}d {hours}h remaining" if hours else f"{days}d remaining"
+        if hours:
+            return f"{hours}h {minutes}m remaining" if minutes else f"{hours}h remaining"
+        return f"{max(1, minutes)}m remaining"
+
+    def _build_strike_embed(
         self,
         target: discord.Member,
         strike: dict[str, Any],
-    ) -> bool:
+        active_count: int,
+    ) -> discord.Embed:
         deadline = acknowledgement_deadline(strike)
         deadline_text = (
             discord.utils.format_dt(deadline, style="F") if deadline else "not configured"
         )
+        embed = discord.Embed(
+            title="Staff strike issued",
+            description=(
+                f"You have received strike **{active_count}/{self.max_strikes}** "
+                f"in **{target.guild.name}**."
+            ),
+            color=discord.Color.red(),
+        )
+        embed.add_field(
+            name="Issued by",
+            value=f"<@{strike['issued_by']}>",
+            inline=True,
+        )
+        embed.add_field(
+            name="Duration",
+            value=self._format_remaining(deadline),
+            inline=True,
+        )
+        embed.add_field(
+            name="Acknowledge by",
+            value=deadline_text,
+            inline=True,
+        )
+        embed.add_field(
+            name="Reason",
+            value=strike.get("reason", "No reason supplied"),
+            inline=False,
+        )
+        embed.add_field(
+            name="\u200b",
+            value=(
+                f"You have **{self.acknowledgement_hours} hours** to acknowledge "
+                "this notice. Missing the deadline makes you ineligible for the "
+                "next payout."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"Strike ID: {strike['id']}")
+        return embed
+
+    async def _send_strike_dm(
+        self,
+        target: discord.Member,
+        strike: dict[str, Any],
+        guild_id: int,
+        active_count: int,
+    ) -> discord.Message | None:
+        view = self._acknowledgement_view(
+            guild_id,
+            target.id,
+            str(strike["id"]),
+        )
         try:
-            await target.send(
-                f"You received a {strike['scope'].replace('_', ' ')} staff strike "
-                f"(`{strike['id']}`). Reason: {strike['reason']}\n"
-                f"Please acknowledge it using your server's ModMail prefix followed "
-                f"by `ackstrike {strike['id']}`. Deadline: {deadline_text}.",
+            message = await target.send(
+                embed=self._build_strike_embed(target, strike, active_count),
+                view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException:
-            return False
-        return True
+            return None
+
+        self._ack_views_by_message[message.id] = view
+        return message
 
     @commands.command(name="strike")
     @commands.guild_only()
@@ -559,7 +737,29 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             if active_count >= self.max_strikes and record.get("roles_removed_at") is None:
                 role_removal_error = await self.remove_staff_roles(member, record)
 
-        dm_sent = await self._send_strike_dm(member, strike)
+        dm_message = await self._send_strike_dm(
+            member,
+            strike,
+            guild_id,
+            active_count,
+        )
+        if dm_message is not None:
+            async with self._record_lock(guild_id, member.id):
+                latest_record = await self.get_record(guild_id, member.id)
+                saved_strike = next(
+                    (
+                        item
+                        for item in latest_record.get("strikes", [])
+                        if item.get("id") == strike["id"]
+                    ),
+                    None,
+                )
+                if saved_strike is not None:
+                    saved_strike["ack_channel_id"] = dm_message.channel.id
+                    saved_strike["ack_message_id"] = dm_message.id
+                    await self.save_record(latest_record)
+
+        dm_sent = dm_message is not None
         response = (
             f"Issued strike `{strike['id']}` to {member.mention} "
             f"({active_count}/{self.max_strikes} active). "
@@ -762,30 +962,111 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
                 )
                 return
 
-            strike = pending[0]
+            selected_strike_id = str(pending[0]["id"])
+
+        strike = await self._mark_strike_acknowledged(
+            guild_id,
+            member.id,
+            selected_strike_id,
+        )
+        if strike is None:
+            await ctx.send("That strike is no longer awaiting acknowledgement.")
+            return
+
+        await self._edit_acknowledgement_message(guild_id, member.id, strike)
+        await ctx.send(f"Strike `{strike['id']}` acknowledged.")
+
+    async def _mark_strike_acknowledged(
+        self,
+        guild_id: int,
+        member_id: int,
+        strike_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._record_lock(guild_id, member_id):
+            record = await self.get_record(guild_id, member_id)
+            strike = next(
+                (
+                    item
+                    for item in self.active_strikes(record)
+                    if str(item.get("id", "")).casefold() == strike_id.casefold()
+                    and item.get("acknowledged_at") is None
+                ),
+                None,
+            )
+            if strike is None:
+                return None
+
             strike["acknowledged_at"] = iso_timestamp()
             await self.save_record(record)
 
+        await self._notify_acknowledgement(guild_id, member_id, strike)
+        return strike
+
+    async def _notify_acknowledgement(
+        self,
+        guild_id: int,
+        member_id: int,
+        strike: dict[str, Any],
+    ) -> None:
         notification_user = self.bot.get_user(self.notification_user_id)
         if notification_user is None:
             try:
-                notification_user = await self.bot.fetch_user(self.notification_user_id)
-            except discord.HTTPException:
-                notification_user = None
-        if notification_user is not None:
-            try:
-                await notification_user.send(
-                    f"{member.mention} acknowledged strike `{strike['id']}` "
-                    f"({strike.get('scope', 'staff')}).",
-                    allowed_mentions=discord.AllowedMentions.none(),
+                notification_user = await self.bot.fetch_user(
+                    self.notification_user_id
                 )
             except discord.HTTPException:
                 log.warning(
-                    "Could not DM acknowledgement notification user %s",
+                    "Could not fetch acknowledgement notification user %s",
                     self.notification_user_id,
                 )
+                return
 
-        await ctx.send(f"Strike `{strike['id']}` acknowledged.")
+        member = self.bot.get_user(member_id)
+        mention = member.mention if member is not None else f"<@{member_id}>"
+        try:
+            await notification_user.send(
+                f"{mention} acknowledged strike `{strike['id']}` "
+                f"({strike.get('scope', 'staff')}) in guild `{guild_id}`.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            log.warning(
+                "Could not DM acknowledgement notification user %s",
+                self.notification_user_id,
+            )
+
+    async def _edit_acknowledgement_message(
+        self,
+        guild_id: int,
+        member_id: int,
+        strike: dict[str, Any],
+    ) -> None:
+        channel_id = strike.get("ack_channel_id")
+        message_id = strike.get("ack_message_id")
+        if not channel_id or not message_id:
+            return
+
+        try:
+            channel = self.bot.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            message = await channel.fetch_message(int(message_id))
+            view = self._acknowledgement_view(
+                guild_id,
+                member_id,
+                str(strike["id"]),
+                disabled=True,
+            )
+            await message.edit(
+                content="Strike acknowledged.",
+                view=view,
+            )
+            self._ack_views_by_message[int(message_id)] = view
+        except discord.HTTPException:
+            log.warning(
+                "Could not update acknowledgement DM for strike %s",
+                strike.get("id"),
+            )
 
     def _can_view_target(
         self, issuer: discord.Member, target: discord.Member
