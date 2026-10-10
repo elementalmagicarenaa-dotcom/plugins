@@ -72,6 +72,13 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
         self.staff_team_role_id = self._positive_id("STAFF_TEAM_ROLE_ID")
         self.notification_user_id = self._positive_id("NOTIFICATION_USER_ID")
         self.game_admin_role_id = self._positive_id("GAME_ADMIN_ROLE_ID")
+        self.game_admin_manager_role_id = self._positive_id(
+            "GAME_ADMIN_MANAGER_ROLE_ID"
+        )
+        if self.game_admin_manager_role_id == self.game_admin_role_id:
+            raise ValueError(
+                "GAME_ADMIN_MANAGER_ROLE_ID must be different from GAME_ADMIN_ROLE_ID"
+            )
         self.max_strikes = int(config.MAX_STRIKES)
         self.acknowledgement_hours = int(config.ACKNOWLEDGEMENT_HOURS)
         self.acknowledgement_check_minutes = int(config.ACKNOWLEDGEMENT_CHECK_MINUTES)
@@ -168,7 +175,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             or any(rank.role_id in role_ids for rank in self.ranks)
         )
 
-    def has_game_admin_manager_authority(self, member: discord.Member) -> bool:
+    def has_game_admin_role(self, member: discord.Member) -> bool:
         return self.game_admin_role_id in self._role_ids(member)
 
     def has_strike_authority(self, member: discord.Member) -> bool:
@@ -192,7 +199,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             target_role_ids=self._role_ids(target),
             ranks=self.ranks,
             authority_rank_name=self.strike_authority_rank_name,
-            game_admin_role_id=self.game_admin_role_id,
+            game_admin_manager_role_id=self.game_admin_manager_role_id,
             scope=scope,
         )
 
@@ -395,7 +402,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
 
         target_rank = self.highest_rank(member)
         if forced_scope == "game_admin":
-            if not self.has_game_admin_manager_authority(member):
+            if not self.has_game_admin_role(member):
                 await ctx.send(
                     "A Game Admin-scoped strike requires the target to have the "
                     "configured Game Admin role."
@@ -404,7 +411,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             scope: StrikeScope = "game_admin"
         elif target_rank is not None:
             scope: StrikeScope = "staff"
-        elif self.has_game_admin_manager_authority(member):
+        elif self.has_game_admin_role(member):
             scope = "game_admin"
         else:
             await ctx.send(
@@ -414,7 +421,10 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
 
         if not self.can_manage_strike_target(issuer, member, scope):
             if scope == "game_admin":
-                message = "Only Game Admins can manage strikes for Game Admin-only members."
+                message = (
+                    "Only holders of the configured Game Admin Manager role can "
+                    "manage Game Admin strikes."
+                )
             else:
                 message = (
                     "You cannot manage this target's staff strikes. "
@@ -601,10 +611,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             if scope not in {"staff", "game_admin"}:
                 await ctx.send("This strike has an unknown scope and cannot be removed.")
                 return
-            if not (
-                self.has_all_strikes_authority(issuer)
-                or self.can_manage_strike_target(issuer, member, scope)
-            ):
+            if not self.can_manage_strike_target(issuer, member, scope):
                 await ctx.send("You cannot manage this target's strikes.")
                 return
 
