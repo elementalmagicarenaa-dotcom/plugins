@@ -34,7 +34,7 @@ MAX_STRIKES = 3
 
 # A strike recipient can acknowledge a strike during this period.
 # Increase or decrease this to match your server's policy.
-ACKNOWLEDGEMENT_HOURS = 24
+ACKNOWLEDGEMENT_HOURS = 48
 
 # How often the plugin checks for missed acknowledgements.
 ACKNOWLEDGEMENT_CHECK_MINUTES = 5
