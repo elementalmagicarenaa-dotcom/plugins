@@ -230,7 +230,10 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
         self.rank_by_name = {rank.name.casefold(): rank for rank in self.ranks}
         self.staff_team_role_id = self._positive_id("STAFF_TEAM_ROLE_ID")
         self.notification_user_id = self._positive_id("NOTIFICATION_USER_ID")
-        self.strike_log_channel_id = self._positive_id("STRIKE_LOG_CHANNEL_ID")
+        self.strike_log_channel_id = self._positive_id(
+            "STRIKE_LOG_CHANNEL_ID",
+            default=1550494565897605180,
+        )
         self.game_admin_role_id = self._positive_id("GAME_ADMIN_ROLE_ID")
         self.game_admin_manager_role_id = self._positive_id(
             "GAME_ADMIN_MANAGER_ROLE_ID"
@@ -267,8 +270,14 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
         self._ack_views_by_message: dict[int, StrikeAcknowledgementView] = {}
 
     @staticmethod
-    def _positive_id(setting_name: str) -> int:
-        value = int(getattr(config, setting_name))
+    def _positive_id(setting_name: str, default: int | None = None) -> int:
+        try:
+            configured_value = getattr(config, setting_name)
+        except AttributeError:
+            if default is None:
+                raise
+            configured_value = default
+        value = int(configured_value)
         if value <= 0:
             raise ValueError(f"{setting_name} must be a positive Discord ID")
         return value
