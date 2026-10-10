@@ -6,6 +6,8 @@ rank to highest rank.
 
 STAFF_TEAM_ROLE_ID = 1461572126174875886
 NOTIFICATION_USER_ID = 1272561419061297184
+# Channel for issue, acknowledgement, removal, and missed-ack audit entries.
+STRIKE_LOG_CHANNEL_ID = 1550494565897605180
 # The role assigned to Game Admin members; it does not grant strike authority.
 GAME_ADMIN_ROLE_ID = 1490692440146051092
 # Separate role whose holders can issue/remove Game Admin-scoped strikes.
