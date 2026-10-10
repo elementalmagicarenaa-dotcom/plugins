@@ -10,14 +10,113 @@ import asyncio
 import logging
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterable, Literal, Mapping
 
 import discord
 from discord.ext import commands, tasks
 
 from . import config
-from .logic import Rank, StrikeScope, build_ranks, can_manage_strike, has_named_rank, highest_rank
+
+try:
+    from .logic import (
+        Rank,
+        StrikeScope,
+        build_ranks,
+        can_manage_strike,
+        has_named_rank,
+        highest_rank,
+    )
+except ModuleNotFoundError as exc:
+    # Some ModMail plugin deployments load only the extension and config files.
+    # Keep the Cog loadable when the optional helper module was not included.
+    if not exc.name or not exc.name.endswith(".logic"):
+        raise
+
+    StrikeScope = Literal["staff", "game_admin"]
+
+    @dataclass(frozen=True)
+    class Rank:
+        name: str
+        role_id: int
+        level: int
+
+    def build_ranks(
+        raw_ranks: Iterable[Mapping[str, object]],
+    ) -> tuple[Rank, ...]:
+        ranks: list[Rank] = []
+        seen_names: set[str] = set()
+        seen_role_ids: set[int] = set()
+        for level, raw_rank in enumerate(raw_ranks):
+            name = str(raw_rank.get("name", "")).strip()
+            try:
+                role_id = int(raw_rank["role_id"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"STAFF_RANKS entry {level + 1} needs an integer role_id"
+                ) from error
+            if not name:
+                raise ValueError(f"STAFF_RANKS entry {level + 1} needs a name")
+            if role_id <= 0:
+                raise ValueError(f"STAFF_RANKS role_id for {name!r} must be positive")
+            if name.casefold() in seen_names:
+                raise ValueError(f"Duplicate staff rank name: {name}")
+            if role_id in seen_role_ids:
+                raise ValueError(f"Duplicate staff role ID: {role_id}")
+            seen_names.add(name.casefold())
+            seen_role_ids.add(role_id)
+            ranks.append(Rank(name=name, role_id=role_id, level=level))
+        return tuple(ranks)
+
+    def highest_rank(role_ids: Iterable[int], ranks: Iterable[Rank]) -> Rank | None:
+        role_id_set = set(role_ids)
+        return next(
+            (rank for rank in reversed(tuple(ranks)) if rank.role_id in role_id_set),
+            None,
+        )
+
+    def has_named_rank(
+        role_ids: Iterable[int], ranks: Iterable[Rank], names: Iterable[str]
+    ) -> bool:
+        role_id_set = set(role_ids)
+        name_set = {name.casefold() for name in names}
+        return any(
+            rank.role_id in role_id_set and rank.name.casefold() in name_set
+            for rank in ranks
+        )
+
+    def can_manage_strike(
+        issuer_role_ids: Iterable[int],
+        target_role_ids: Iterable[int],
+        ranks: Iterable[Rank],
+        authority_rank_name: str,
+        game_admin_manager_role_id: int,
+        scope: StrikeScope,
+    ) -> bool:
+        issuer_ids = set(issuer_role_ids)
+        if scope == "game_admin":
+            return (
+                game_admin_manager_role_id > 0
+                and game_admin_manager_role_id in issuer_ids
+            )
+        rank_list = tuple(ranks)
+        issuer_rank = highest_rank(issuer_ids, rank_list)
+        target_rank = highest_rank(target_role_ids, rank_list)
+        authority_rank = next(
+            (
+                rank
+                for rank in rank_list
+                if rank.name.casefold() == authority_rank_name.casefold()
+            ),
+            None,
+        )
+        if issuer_rank is None or target_rank is None or authority_rank is None:
+            return False
+        return (
+            issuer_rank.level >= authority_rank.level
+            and target_rank.level <= issuer_rank.level
+        )
 
 log = logging.getLogger(__name__)
 UTC = timezone.utc
