@@ -16,7 +16,7 @@ index 36fa5ab..23aab9e 100644
          )
  
 +    def has_game_admin_manager_authority(self, member: discord.Member) -> bool:
-+        game_admin_role_id = int(getattr(config, "GAME_ADMIN_ROLE_ID", 0))
++        game_admin_role_id = int(getattr(config, "GAME_ADMIN_ROLE_ID", 1555214047161618462 ))
 +        return game_admin_role_id > 0 and any(
 +            role.id == game_admin_role_id for role in member.roles
 +        )
