@@ -230,6 +230,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
         self.rank_by_name = {rank.name.casefold(): rank for rank in self.ranks}
         self.staff_team_role_id = self._positive_id("STAFF_TEAM_ROLE_ID")
         self.notification_user_id = self._positive_id("NOTIFICATION_USER_ID")
+        self.strike_log_channel_id = self._positive_id("STRIKE_LOG_CHANNEL_ID")
         self.game_admin_role_id = self._positive_id("GAME_ADMIN_ROLE_ID")
         self.game_admin_manager_role_id = self._positive_id(
             "GAME_ADMIN_MANAGER_ROLE_ID"
@@ -337,12 +338,14 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
                 continue
 
             guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
 
             async with self._record_lock(guild_id, member_id):
                 record = await self.get_record(guild_id, member_id)
                 now = utc_now()
+                await self._retry_unlogged_audit_events(record, now)
+                if guild is None:
+                    continue
+
                 for strike in pending_acknowledgements(record):
                     deadline = acknowledgement_deadline(strike)
                     if deadline is None or deadline > now:
@@ -356,7 +359,7 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
                             await self.save_record(record)
 
                     if strike.get("missed_ack_log_sent_at") is None:
-                        if await self.log_missed_acknowledgement(guild, record, strike):
+                        if await self.log_missed_acknowledgement(record, strike):
                             strike["missed_ack_log_sent_at"] = iso_timestamp(now)
                             await self.save_record(record)
 
@@ -513,35 +516,199 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             return False
         return True
 
-    async def log_missed_acknowledgement(
+    async def _send_strike_audit_log(
         self,
-        guild: discord.Guild,
-        record: dict[str, Any],
+        guild_id: int,
+        member_id: int,
         strike: dict[str, Any],
+        event: str,
     ) -> bool:
-        channel_id = strike.get("issued_in_channel_id")
-        if not channel_id:
+        event_details = {
+            "issued": (
+                "Staff strike issued",
+                f"<@{member_id}> received a staff strike.",
+                0xD9534F,
+                "Issued by",
+                strike.get("issued_by"),
+            ),
+            "acknowledged": (
+                "Strike acknowledged",
+                f"<@{member_id}> acknowledged a staff strike.",
+                0x3BA55D,
+                "Acknowledged by",
+                member_id,
+            ),
+            "removed": (
+                "Strike removed",
+                f"A staff strike was removed from <@{member_id}>.",
+                0x747F8D,
+                "Removed by",
+                strike.get("removed_by"),
+            ),
+            "missed_acknowledgement": (
+                "Strike acknowledgement missed",
+                f"<@{member_id}> did not acknowledge a staff strike before its deadline.",
+                0xF0A23B,
+                "Status",
+                "Deadline missed",
+            ),
+        }
+        details = event_details.get(event)
+        if details is None:
+            log.error("Unknown strike audit event %s", event)
             return False
 
-        channel = guild.get_channel(int(channel_id))
+        channel = self.bot.get_channel(self.strike_log_channel_id)
         if channel is None:
             try:
-                channel = await self.bot.fetch_channel(int(channel_id))
+                channel = await self.bot.fetch_channel(self.strike_log_channel_id)
             except discord.HTTPException:
-                log.warning("Could not fetch strike audit channel %s", channel_id)
+                log.error(
+                    "Could not fetch configured strike-log channel %s",
+                    self.strike_log_channel_id,
+                )
                 return False
 
-        member_id = int(record["member_id"])
+        channel_guild = getattr(channel, "guild", None)
+        if channel_guild is None or int(channel_guild.id) != guild_id:
+            log.error(
+                "Configured strike-log channel %s is not in guild %s",
+                self.strike_log_channel_id,
+                guild_id,
+            )
+            return False
+
+        title, description, color, actor_label, actor_value = details
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=utc_now(),
+        )
+        embed.add_field(name="Target", value=f"<@{member_id}>", inline=True)
+        embed.add_field(
+            name="Strike ID",
+            value=f"`{strike.get('id', 'unknown')}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Scope",
+            value=str(strike.get("scope", "staff")).replace("_", " ").title(),
+            inline=True,
+        )
+        if actor_value is not None:
+            embed.add_field(
+                name=actor_label,
+                value=(
+                    f"<@{actor_value}>"
+                    if isinstance(actor_value, int)
+                    else str(actor_value)
+                ),
+                inline=True,
+            )
+        issued_by = strike.get("issued_by")
+        if issued_by is not None and event != "issued":
+            embed.add_field(name="Originally issued by", value=f"<@{issued_by}>", inline=True)
+        reason = str(strike.get("reason", "No reason supplied"))[:1024]
+        embed.add_field(name="Reason", value=reason or "No reason supplied", inline=False)
+        embed.set_footer(text=f"Guild ID: {guild_id}")
+
         try:
             await channel.send(
-                f"Strike `{strike['id']}` for <@{member_id}> was not acknowledged "
-                f"by its deadline.",
+                embed=embed,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException:
-            log.warning("Could not post missed-ack log to channel %s", channel_id)
+            log.exception(
+                "Could not post %s audit event to channel %s",
+                event,
+                self.strike_log_channel_id,
+            )
             return False
         return True
+
+    async def _ensure_strike_audit_log(
+        self,
+        guild_id: int,
+        member_id: int,
+        strike_id: str,
+        event: str,
+    ) -> bool:
+        event_fields = {
+            "issued": ("issued_at", "issue_log_sent_at"),
+            "acknowledged": ("acknowledged_at", "acknowledgement_log_sent_at"),
+            "removed": ("removed_at", "removal_log_sent_at"),
+        }
+        fields = event_fields.get(event)
+        if fields is None:
+            return False
+        event_at_field, sent_at_field = fields
+
+        async with self._record_lock(guild_id, member_id):
+            record = await self.get_record(guild_id, member_id)
+            strike = next(
+                (
+                    item
+                    for item in record.get("strikes", [])
+                    if str(item.get("id", "")).casefold() == strike_id.casefold()
+                ),
+                None,
+            )
+            if strike is None or strike.get(event_at_field) is None:
+                return False
+            if strike.get(sent_at_field) is not None:
+                return True
+            if not await self._send_strike_audit_log(
+                guild_id,
+                member_id,
+                strike,
+                event,
+            ):
+                return False
+
+            strike[sent_at_field] = iso_timestamp()
+            await self.save_record(record)
+            return True
+
+    async def _retry_unlogged_audit_events(
+        self,
+        record: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        event_fields = (
+            ("issued", "issued_at", "issue_log_sent_at"),
+            ("acknowledged", "acknowledged_at", "acknowledgement_log_sent_at"),
+            ("removed", "removed_at", "removal_log_sent_at"),
+        )
+        guild_id = int(record["guild_id"])
+        member_id = int(record["member_id"])
+        for strike in record.get("strikes", []):
+            for event, event_at_field, sent_at_field in event_fields:
+                if (
+                    strike.get(event_at_field) is None
+                    or strike.get(sent_at_field) is not None
+                ):
+                    continue
+                if await self._send_strike_audit_log(
+                    guild_id,
+                    member_id,
+                    strike,
+                    event,
+                ):
+                    strike[sent_at_field] = iso_timestamp(now)
+                    await self.save_record(record)
+
+    async def log_missed_acknowledgement(
+        self,
+        record: dict[str, Any],
+        strike: dict[str, Any],
+    ) -> bool:
+        return await self._send_strike_audit_log(
+            int(record["guild_id"]),
+            int(record["member_id"]),
+            strike,
+            "missed_acknowledgement",
+        )
 
     @staticmethod
     def _format_remaining(deadline: datetime | None) -> str:
@@ -759,6 +926,12 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
                     saved_strike["ack_message_id"] = dm_message.id
                     await self.save_record(latest_record)
 
+        audit_logged = await self._ensure_strike_audit_log(
+            guild_id,
+            member.id,
+            str(strike["id"]),
+            "issued",
+        )
         dm_sent = dm_message is not None
         response = (
             f"Issued strike `{strike['id']}` to {member.mention} "
@@ -774,6 +947,11 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             )
         if not dm_sent:
             response += " I could not DM the member; they may have DMs disabled."
+        if not audit_logged:
+            response += (
+                " The strike was recorded, but its audit log could not be posted; "
+                "the plugin will retry."
+            )
         await ctx.send(
             response,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -919,9 +1097,20 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             strike["removed_by"] = issuer.id
             await self.save_record(record)
 
-        await ctx.send(
+        audit_logged = await self._ensure_strike_audit_log(
+            guild_id,
+            member.id,
+            str(strike["id"]),
+            "removed",
+        )
+        response = (
             f"Removed strike `{strike['id']}` from {member.mention}. "
-            f"{len(self.active_strikes(record))}/{self.max_strikes} active remain.",
+            f"{len(self.active_strikes(record))}/{self.max_strikes} active remain."
+        )
+        if not audit_logged:
+            response += " The audit log could not be posted yet; the plugin will retry."
+        await ctx.send(
+            response,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -1000,6 +1189,12 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             await self.save_record(record)
 
         await self._notify_acknowledgement(guild_id, member_id, strike)
+        await self._ensure_strike_audit_log(
+            guild_id,
+            member_id,
+            str(strike["id"]),
+            "acknowledged",
+        )
         return strike
 
     async def _notify_acknowledgement(
