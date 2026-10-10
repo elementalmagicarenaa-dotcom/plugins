@@ -7,7 +7,7 @@ plugin's MongoDB partition; no direct access to ``bot.api`` is used.
 from __future__ import annotations
 
 import asyncio
-import logginga
+import logging
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
