@@ -9,6 +9,7 @@ Configure the values in CONFIG before loading the plugin.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -56,12 +57,12 @@ class PayoutConfig:
 CONFIG = PayoutConfig(
     guild_id=None,  # Example: 123456789012345678
     target_role_ids=(
-         1484613327442284795,
-         1461572126174875886,
-         1490692440146051092,
+        1484613327442284795,
+        1461572126174875886,
+        1490692440146051092,
     ),
     reviewer_user_ids=(
-         1272561419061297184,
+        1272561419061297184,
     ),
     head_administrator_name="Azv",
 )
@@ -71,6 +72,11 @@ OPEN_FORM_CUSTOM_ID = "payouts:open-form"
 AMOUNT_FORM_CUSTOM_ID = "payouts:amount-form"
 APPROVE_CUSTOM_ID = "payouts:approve"
 DENY_CUSTOM_ID = "payouts:deny"
+
+# Discord requires a reply within 3 seconds. Pre-checks that run before a modal
+# opens are capped below that so a slow database/plugin can never make the
+# button show "This interaction failed".
+PRECHECK_TIMEOUT = 2.0
 
 
 def _new_application_id() -> str:
@@ -97,12 +103,37 @@ def _application_id_from_message(message: discord.Message | None) -> str | None:
     return footer.removeprefix(prefix).strip() or None
 
 
+async def _report_error(interaction: discord.Interaction, error: Exception) -> None:
+    """Log an error and always tell the user something happened."""
+
+    logger.error("Payout button error", exc_info=error)
+    message = (
+        "Something went wrong while handling that. Please try again, and if it "
+        "keeps happening contact an administrator."
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 class PayoutOpenView(discord.ui.View):
     """Persistent view delivered to eligible members when payouts open."""
 
     def __init__(self, plugin: "Payouts") -> None:
         super().__init__(timeout=None)
         self.plugin = plugin
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        await _report_error(interaction, error)
 
     @discord.ui.button(
         label="Fill out payout form",
@@ -121,19 +152,25 @@ class PayoutOpenView(discord.ui.View):
             )
             return
 
-        if await self.plugin.has_active_application(interaction.user.id):
-            await interaction.response.send_message(
-                "You already have a payout application being reviewed.",
-                ephemeral=True,
+        # Never let slow checks stop the modal from opening in time. If the
+        # checks time out they are simply re-run when the form is submitted.
+        try:
+            block, resume = await asyncio.wait_for(
+                self.plugin.precheck(interaction.user.id, interaction.guild_id),
+                timeout=PRECHECK_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            logger.warning("Payout pre-check timed out; opening form anyway.")
+            block, resume = None, False
+
+        if block is not None:
+            await interaction.response.send_message(block, ephemeral=True)
             return
 
-        submission_block = await self.plugin.payout_submission_block_reason(
-            interaction.user.id,
-            interaction.guild_id,
-        )
-        if submission_block is not None:
-            await interaction.response.send_message(submission_block, ephemeral=True)
+        if resume:
+            # The applicant started as In-Game Admin but never answered the
+            # second question. Let them pick up where they left off.
+            await interaction.response.send_modal(PayoutAmountModal(self.plugin))
             return
 
         await interaction.response.send_modal(PayoutDetailsModal(self.plugin))
@@ -145,6 +182,14 @@ class PayoutAmountView(discord.ui.View):
     def __init__(self, plugin: "Payouts") -> None:
         super().__init__(timeout=None)
         self.plugin = plugin
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        await _report_error(interaction, error)
 
     @discord.ui.button(
         label="Continue application",
@@ -163,7 +208,14 @@ class PayoutAmountView(discord.ui.View):
             )
             return
 
-        application = await self.plugin.find_waiting_for_amount(interaction.user.id)
+        try:
+            application = await asyncio.wait_for(
+                self.plugin.find_waiting_for_amount(interaction.user.id),
+                timeout=PRECHECK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            application = {}  # Re-checked on submit.
+
         if application is None:
             await interaction.response.send_message(
                 "That payout form is no longer waiting for this question.",
@@ -183,6 +235,14 @@ class PayoutReviewView(discord.ui.View):
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = disabled
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        await _report_error(interaction, error)
 
     @discord.ui.button(
         label="Approve payout",
@@ -206,6 +266,13 @@ class PayoutReviewView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button[PayoutReviewView],
     ) -> None:
+        if interaction.user.id not in CONFIG.reviewer_user_ids:
+            await interaction.response.send_message(
+                "You are not configured to review payout applications.",
+                ephemeral=True,
+            )
+            return
+
         application_id = _application_id_from_message(interaction.message)
         if application_id is None:
             await interaction.response.send_message(
@@ -243,9 +310,12 @@ class PayoutDenialModal(discord.ui.Modal, title="Deny payout"):
             denial_reason=str(self.reason.value).strip(),
         )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await _report_error(interaction, error)
+
 
 class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
-    """The first four payout questions."""
+    """The first payout questions."""
 
     roblox_username = discord.ui.TextInput(
         label="Roblox Username",
@@ -294,6 +364,9 @@ class PayoutDetailsModal(discord.ui.Modal, title="Staff payout application"):
             },
         )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await _report_error(interaction, error)
+
 
 class PayoutAmountModal(discord.ui.Modal, title="In-Game Admin details"):
     """The additional question shown only to In-Game Admins."""
@@ -315,6 +388,9 @@ class PayoutAmountModal(discord.ui.Modal, title="In-Game Admin details"):
             str(self.amount_moderated.value).strip(),
         )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await _report_error(interaction, error)
+
 
 class Payouts(commands.Cog):
     """Open, collect, and review staff payout applications."""
@@ -325,9 +401,10 @@ class Payouts(commands.Cog):
         self.payouts_open = False
         self.payout_cycle_id: str | None = None
         self.payout_guild_id: int | None = None
+        self._persistent_views: list[discord.ui.View] = []
 
     async def cog_load(self) -> None:
-        """Restore the open/closed state when Modmail loads the plugin."""
+        """Restore state and register the long-lived buttons."""
 
         state = await self.db.find_one({"_id": "state"})
         self.payouts_open = bool(state and state.get("payouts_open", False))
@@ -344,6 +421,23 @@ class Payouts(commands.Cog):
                 {"$set": {"payout_cycle_id": self.payout_cycle_id}},
                 upsert=True,
             )
+
+        # Buttons use fixed custom IDs and timeout=None, so DMs sent days or
+        # weeks ago keep working after restarts and plugin reloads.
+        self._persistent_views = [
+            PayoutOpenView(self),
+            PayoutAmountView(self),
+            PayoutReviewView(self),
+        ]
+        for view in self._persistent_views:
+            self.bot.add_view(view)
+
+    async def cog_unload(self) -> None:
+        """Drop old views so a reload never leaves buttons tied to stale state."""
+
+        for view in self._persistent_views:
+            view.stop()
+        self._persistent_views = []
 
     def _configuration_errors(self) -> list[str]:
         errors: list[str] = []
@@ -578,11 +672,19 @@ class Payouts(commands.Cog):
                 "Payout eligibility could not be verified because the Staff "
                 "Strikes plugin is not loaded."
             )
-        return await strike_plugin.payout_block_reason(
-            resolved_guild_id,
-            user_id,
-            payout_cycle_id or self.payout_cycle_id,
-        )
+        try:
+            return await strike_plugin.payout_block_reason(
+                resolved_guild_id,
+                user_id,
+                payout_cycle_id or self.payout_cycle_id,
+            )
+        except Exception:
+            # A broken StaffStrikes plugin used to make the button fail silently.
+            logger.exception("StaffStrikes.payout_block_reason raised an error.")
+            return (
+                "Payout eligibility could not be verified right now. "
+                "Please try again later or contact an administrator."
+            )
 
     async def payout_submission_block_reason(
         self,
@@ -595,16 +697,15 @@ class Payouts(commands.Cog):
         if strike_block is not None:
             return strike_block
 
-        applications = [
-            application
-            async for application in self.db.find(
-                {
-                    "applicant_id": str(user_id),
-                    "payout_cycle_id": self.payout_cycle_id,
-                }
-            )
-        ]
-        if applications:
+        # Unfinished In-Game Admin forms don't count as a submission.
+        existing = await self.db.find_one(
+            {
+                "applicant_id": str(user_id),
+                "payout_cycle_id": self.payout_cycle_id,
+                "status": {"$ne": "awaiting_amount"},
+            }
+        )
+        if existing:
             return (
                 "You have already submitted a payout request for this payout cycle. "
                 "You can submit another request when the next payout cycle opens."
@@ -612,17 +713,41 @@ class Payouts(commands.Cog):
         return None
 
     async def has_active_application(self, user_id: int) -> bool:
-        for status in ("awaiting_amount", "pending"):
-            if await self.db.find_one(
-                {"applicant_id": str(user_id), "status": status}
-            ):
-                return True
-        return False
+        """True when the user has a request waiting on a reviewer this cycle."""
+
+        return bool(
+            await self.db.find_one(
+                {
+                    "applicant_id": str(user_id),
+                    "status": "pending",
+                    "payout_cycle_id": self.payout_cycle_id,
+                }
+            )
+        )
 
     async def find_waiting_for_amount(self, user_id: int) -> dict[str, Any] | None:
         return await self.db.find_one(
-            {"applicant_id": str(user_id), "status": "awaiting_amount"}
+            {
+                "applicant_id": str(user_id),
+                "status": "awaiting_amount",
+                "payout_cycle_id": self.payout_cycle_id,
+            }
         )
+
+    async def precheck(
+        self,
+        user_id: int,
+        guild_id: int | None,
+    ) -> tuple[str | None, bool]:
+        """Return (block message, resume_amount_step) for the open-form button."""
+
+        if await self.find_waiting_for_amount(user_id) is not None:
+            return None, True
+
+        if await self.has_active_application(user_id):
+            return "You already have a payout application being reviewed.", False
+
+        return await self.payout_submission_block_reason(user_id, guild_id), False
 
     async def receive_details(
         self,
@@ -644,6 +769,14 @@ class Payouts(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        # Starting over replaces any unfinished In-Game Admin form.
+        await self.db.delete_many(
+            {
+                "applicant_id": str(interaction.user.id),
+                "status": "awaiting_amount",
+            }
+        )
 
         submission_block = await self.payout_submission_block_reason(
             interaction.user.id,
@@ -670,7 +803,8 @@ class Payouts(commands.Cog):
             await self.db.insert_one(application)
             await interaction.followup.send(
                 "Because you selected an In-Game Admin rank, please answer the "
-                "additional question below.",
+                "additional question below. If this message disappears, press "
+                "the original \"Fill out payout form\" button again to continue.",
                 view=PayoutAmountView(self),
                 ephemeral=True,
             )
@@ -918,10 +1052,6 @@ class Payouts(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
-    plugin = Payouts(bot)
-    await bot.add_cog(plugin)
-
-    # All custom IDs are fixed, so these views continue working after a restart.
-    bot.add_view(PayoutOpenView(plugin))
-    bot.add_view(PayoutAmountView(plugin))
-    bot.add_view(PayoutReviewView(plugin))
+    # The persistent views are registered in Payouts.cog_load and removed in
+    # Payouts.cog_unload, so nothing else is needed here.
+    await bot.add_cog(Payouts(bot))
