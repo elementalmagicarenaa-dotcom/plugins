@@ -454,6 +454,32 @@ class StaffStrikes(commands.Cog, name="StaffStrikes"):
             if strike.get("status") == "active"
         ]
 
+    async def payout_block_reason(
+        self,
+        guild_id: int,
+        user_id: int,
+        payout_cycle_id: str | None = None,
+    ) -> str | None:
+        """Used by the Payouts plugin. Return None if the member may be paid,
+        or a message explaining why they are blocked."""
+        record = await self.get_record(int(guild_id), int(user_id))
+        now = utc_now()
+        for strike in self.active_strikes(record):
+            deadline = acknowledgement_deadline(strike)
+            if deadline is None:
+                continue
+            acknowledged_at = as_utc_datetime(strike.get("acknowledged_at"))
+            missed = (
+                (acknowledged_at is None and deadline <= now)
+                or (acknowledged_at is not None and acknowledged_at > deadline)
+            )
+            if missed:
+                return (
+                    f"You missed the acknowledgement deadline for staff strike "
+                    f"`{strike.get('id', '?')}`, so you are not eligible for this payout."
+                )
+        return None
+
     def _strike_roles_to_remove(self, member: discord.Member) -> list[discord.Role]:
         role_ids = {rank.role_id for rank in self.ranks}
         role_ids.update(
